@@ -29,20 +29,59 @@ st.markdown("""
         margin-bottom: 2rem;
     }
     .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
         padding: 20px;
         border-radius: 10px;
-        color: white;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        color: #111;
+        box-shadow: 0 6px 12px rgba(16,24,40,0.06);
+        border: 1px solid rgba(16,24,40,0.06);
     }
     .stMetric {
-        background-color: #f0f2f6;
+        background-color: #ffffff;
         padding: 15px;
         border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        box-shadow: 0 3px 6px rgba(16,24,40,0.04);
+        color: #111;
+        border: 1px solid rgba(16,24,40,0.04);
     }
     .sidebar .sidebar-content {
         background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
+    }
+
+    /* Ajustes para modo escuro (melhor contraste e bordas sutis) */
+    @media (prefers-color-scheme: dark) {
+        .metric-card {
+            background: linear-gradient(135deg, #2b2f3a 0%, #1b1e26 100%);
+            color: #e6e6e6;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.6);
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        .stMetric {
+            background-color: #151619;
+            color: #e6e6e6;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.6);
+            border: 1px solid rgba(255,255,255,0.04);
+        }
+        .sidebar .sidebar-content {
+            background: linear-gradient(180deg, #2b2f3a 0%, #1b1e26 100%);
+        }
+    }
+
+    /* For older browsers or Streamlit themes that don't set prefers-color-scheme,
+       provide an explicit light-mode override as well */
+    @media (prefers-color-scheme: light), (prefers-color-scheme: no-preference) {
+        .metric-card {
+            background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
+            color: #111;
+            box-shadow: 0 6px 12px rgba(16,24,40,0.06);
+            border: 1px solid rgba(16,24,40,0.06);
+        }
+        .stMetric {
+            background-color: #ffffff;
+            color: #111;
+            box-shadow: 0 3px 6px rgba(16,24,40,0.04);
+            border: 1px solid rgba(16,24,40,0.04);
+        }
     }
 </style>
 """, unsafe_allow_html=True)
