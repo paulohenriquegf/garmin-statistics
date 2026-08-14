@@ -1,6 +1,22 @@
-"""Smoke test via AppTest: período completo + combos de filtro Ano/Mês/Semana."""
+"""Smoke test via AppTest: período completo + combos de filtro Ano/Mês/Semana.
+
+Use SEM_STATS=1 para simular ambiente sem statsmodels (fallback de trendlines).
+"""
+import os
 import sys
-from streamlit.testing.v1 import AppTest
+
+if os.environ.get("SEM_STATS"):
+    class _Bloqueia:
+        def find_module(self, name, path=None):
+            if name == "statsmodels" or name.startswith("statsmodels."):
+                return self
+
+        def load_module(self, name):
+            raise ImportError(name)
+
+    sys.meta_path.insert(0, _Bloqueia())
+
+from streamlit.testing.v1 import AppTest  # noqa: E402
 
 DADOS = r"C:\Users\paulo\Downloads\d1332fc4-ec15-4bce-b1ce-e6c979982b81_1"
 
@@ -14,12 +30,12 @@ def rodar(modo="Ano / Mês / Semana", ano=None, mes=None, semana=None):
     rb = next(r for r in at.radio if r.key == "filtro_modo")
     rb.set_value(modo)
     at.run()
-    if mes == "__MES__":
-        sb = next(s for s in at.selectbox if s.key == "filtro_mes")
-        mes = next(o for o in sb.options if "ago" in str(o).lower())
     if ano is not None:
         next(s for s in at.selectbox if s.key == "filtro_ano").select(ano)
         at.run()
+    if mes == "__MES__":
+        sb = next(s for s in at.selectbox if s.key == "filtro_mes")
+        mes = next(o for o in sb.options if "ago" in str(o).lower())
     if mes is not None:
         next(s for s in at.selectbox if s.key == "filtro_mes").select(mes)
         at.run()
@@ -44,9 +60,6 @@ for nome, kwargs in casos:
             falhas += 1
             for e in ex[:3]:
                 print("   ", e[:300])
-        if nome == "Ano 2026":
-            sb = next(s for s in at.selectbox if s.key == "filtro_mes")
-            print("    opcoes mes:", sb.options[:15])
     except Exception as exc:  # noqa: BLE001
         falhas += 1
         print(f"ERRO {nome}: {exc!r}")

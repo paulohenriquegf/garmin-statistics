@@ -31,6 +31,16 @@ from viz import (
     ordem_dias_pt, rotulo_dia, rotulo_dia_curto, style_fig, theme_base,
 )
 
+# Trendlines do Plotly (lowess/ols) dependem de statsmodels; sem ele, omite a
+# linha de tendência em vez de quebrar o app (ex.: ambiente sem a dependência).
+try:
+    import statsmodels  # noqa: F401
+    TREND_SUAVE = "lowess"
+    TREND_RETA = "ols"
+except ImportError:
+    TREND_SUAVE = None
+    TREND_RETA = None
+
 st.set_page_config(
     page_title="Garmin Connect Analytics",
     page_icon="⚡",
@@ -612,7 +622,7 @@ def view_performance():
 
         col1, col2 = st.columns(2)
         with col1:
-            fig = px.scatter(corridas, x="start", y="ritmo_min_km", trendline="lowess",
+            fig = px.scatter(corridas, x="start", y="ritmo_min_km", trendline=TREND_SUAVE,
                              color=corridas["dist_km"].round(1).astype(str),
                              labels={"start": "", "ritmo_min_km": "ritmo (min/km)", "color": "km"},
                              color_discrete_sequence=PALETA,
@@ -631,7 +641,7 @@ def view_performance():
             fig.update_yaxes(autorange="reversed")
             st.plotly_chart(style_fig(fig), use_container_width=True)
         with col2:
-            fig = px.scatter(corridas, x="dist_km", y="fc_media", trendline="ols",
+            fig = px.scatter(corridas, x="dist_km", y="fc_media", trendline=TREND_RETA,
                              labels={"dist_km": "distância (km)", "fc_media": "FC média"},
                              color_discrete_sequence=[PALETA[0]],
                              title="Desgaste: distância × FC média")
@@ -652,7 +662,7 @@ def view_performance():
                     with cols[i % 2]:
                         un = {"cadencia": "passos/min", "passada_m": "m", "gct_ms": "ms", "oscilacao_mm": "mm"}[c]
                         tmp = corridas.dropna(subset=[c])
-                        fig = px.scatter(tmp, x="start", y=c, trendline="lowess",
+                        fig = px.scatter(tmp, x="start", y=c, trendline=TREND_SUAVE,
                                          labels={"start": "", c: un}, color_discrete_sequence=[PALETA[(i + 1) % len(PALETA)]])
                         st.plotly_chart(style_fig(fig, height=280), use_container_width=True)
     else:
@@ -750,7 +760,7 @@ def view_sono():
     st.subheader("🌗 Consistência do horário de dormir")
     c1, c2 = st.columns([3, 2])
     with c1:
-        fig = px.scatter(x=s["date"], y=s["hora_dormir"] % 24, trendline="lowess",
+        fig = px.scatter(x=s["date"], y=s["hora_dormir"] % 24, trendline=TREND_SUAVE,
                          labels={"x": "", "y": "hora"}, color_discrete_sequence=[PALETA[5]])
         fig.update_traces(
             selector=dict(mode="markers"),
@@ -903,7 +913,7 @@ def view_saude():
         cols = st.columns(len(disp))
         for col, (c, t, ref) in zip(cols, disp):
             with col:
-                fig = px.scatter(h, x="date", y=c, trendline="lowess", labels={"date": "", c: ""},
+                fig = px.scatter(h, x="date", y=c, trendline=TREND_SUAVE, labels={"date": "", c: ""},
                                  color_discrete_sequence=[PALETA[2]])
                 fig.add_hline(y=ref, line_dash="dash", line_color=C_NEUTRO)
                 fig.update_layout(title=t)
@@ -1133,7 +1143,7 @@ def view_correlacoes():
     with cc2:
         default_y = list(opcoes).index("Sono (h)") if "Sono (h)" in opcoes else 1
         y_lbl = st.selectbox("Eixo Y", list(opcoes), index=default_y)
-    fig = px.scatter(m.reset_index(), x=opcoes[x_lbl], y=opcoes[y_lbl], trendline="ols",
+    fig = px.scatter(m.reset_index(), x=opcoes[x_lbl], y=opcoes[y_lbl], trendline=TREND_RETA,
                      labels={"date": "Data", "index": "Data"})
     st.plotly_chart(style_fig(fig), use_container_width=True)
 
