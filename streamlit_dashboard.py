@@ -1,2919 +1,1014 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import json
-import zipfile
+"""
+Garmin Connect Analytics — dashboard analítico completo.
+
+Estrutura:
+  streamlit_dashboard.py  -> UI, abas e views
+  garmin_data.py          -> parser do export (GDPR) do Garmin
+  viz.py                  -> tema adaptável (claro/escuro), helpers de gráfico
+
+Como usar:
+  * Faça upload do ZIP exportado do Garmin Connect, OU
+  * Informe o caminho local da pasta extraída no campo da barra lateral.
+"""
+
+import datetime as dt
+import io
 import tempfile
 from pathlib import Path
 
-# Configuração da página
-st.set_page_config(
-    page_title="Garmin Connect - Dashboard de Análise",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded"
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+import garmin_data as gd
+from garmin_data import GarminExport
+from viz import (
+    C_NEG, C_NEUTRO, C_POS, PALETA, SEQ_AZUL, SEQ_DIVERG, SEQ_VERDE,
+    SEQ_VERM, card_titulo_icon, fmt_hora_frac, fmt_min, fmt_ritmo,
+    inject_css, kpi, linha_resumo_periodo, media_circular_horario,
+    ordem_dias_pt, rotulo_dia, rotulo_dia_curto, style_fig, theme_base,
 )
 
-# CSS customizado para melhorar o visual
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        background: linear-gradient(90deg, #00C9FF 0%, #92FE9D 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: #111;
-        box-shadow: 0 6px 12px rgba(16,24,40,0.06);
-        border: 1px solid rgba(16,24,40,0.06);
-    }
-    .stMetric {
-        background-color: #ffffff;
-        padding: 15px;
-        border-radius: 8px;
-        box-shadow: 0 3px 6px rgba(16,24,40,0.04);
-        color: #111;
-        border: 1px solid rgba(16,24,40,0.04);
-    }
-    .sidebar .sidebar-content {
-        background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
-    }
-
-    /* Ajustes para modo escuro (melhor contraste e bordas sutis) */
-    @media (prefers-color-scheme: dark) {
-        .metric-card {
-            background: linear-gradient(135deg, #2b2f3a 0%, #1b1e26 100%);
-            color: #e6e6e6;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.6);
-            border: 1px solid rgba(255,255,255,0.06);
-        }
-        .stMetric {
-            background-color: #151619;
-            color: #e6e6e6;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.6);
-            border: 1px solid rgba(255,255,255,0.04);
-        }
-        .sidebar .sidebar-content {
-            background: linear-gradient(180deg, #2b2f3a 0%, #1b1e26 100%);
-        }
-    }
-
-    /* For older browsers or Streamlit themes that don't set prefers-color-scheme,
-       provide an explicit light-mode override as well */
-    @media (prefers-color-scheme: light), (prefers-color-scheme: no-preference) {
-        .metric-card {
-            background: linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
-            color: #111;
-            box-shadow: 0 6px 12px rgba(16,24,40,0.06);
-            border: 1px solid rgba(16,24,40,0.06);
-        }
-        .stMetric {
-            background-color: #ffffff;
-            color: #111;
-            box-shadow: 0 3px 6px rgba(16,24,40,0.04);
-            border: 1px solid rgba(16,24,40,0.04);
-        }
-    }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(
+    page_title="Garmin Connect Analytics",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+inject_css()
 
 
-class GarminDataAnalyzer:
-    """Classe para processar e analisar dados do Garmin Connect"""
-    
-    def __init__(self, zip_file):
-        self.zip_file = zip_file
-        self.temp_dir = tempfile.mkdtemp()
-        self.activities_df = None
-        self.sleep_df = None
-        self.health_df = None
-        self.hydration_df = None
-        self.user_profile = None
-        
-    def extract_zip(self):
-        """Extrai o arquivo ZIP"""
-        with zipfile.ZipFile(self.zip_file, 'r') as zip_ref:
-            zip_ref.extractall(self.temp_dir)
-            
-    def find_files(self, pattern):
-        """Encontra arquivos por padrão"""
-        return list(Path(self.temp_dir).rglob(pattern))
-    
-    def safe_parse_timestamp(self, series, column_name="timestamp"):
-        """Converte timestamps de forma segura, lidando com diferentes formatos"""
-        try:
-            # Verificar se todos os valores são nulos
-            if series.isna().all():
-                return pd.to_datetime(series, errors='coerce')
-            
-            # Primeiro, tentar converter valores numéricos como milissegundos
-            # Isso funciona para int, float, ou strings numéricas
-            numeric_series = pd.to_numeric(series, errors='coerce')
-            
-            # Se conseguiu converter para numérico (e não são todos nulos)
-            if not numeric_series.isna().all():
-                # Verificar se os valores parecem timestamps em milissegundos
-                # (valores muito grandes, típicos de timestamps)
-                max_value = numeric_series.max()
-                if max_value > 1000000000000:  # Típico de timestamps em ms
-                    return pd.to_datetime(numeric_series, unit='ms', errors='coerce')
-                elif max_value > 1000000000:  # Pode ser timestamp em segundos
-                    return pd.to_datetime(numeric_series, unit='s', errors='coerce')
-            
-            # Se não é numérico, tentar converter como string (ISO format, etc)
-            # Pandas automaticamente detecta formatos ISO como "2025-09-25T01:00:34.0"
-            result = pd.to_datetime(series, errors='coerce')
-            
-            return result
-            
-        except Exception as e:
-            st.warning(f"Aviso ao converter {column_name}: {str(e)}")
-            return pd.to_datetime(series, errors='coerce')
-    
-    def load_activities(self):
-        """Carrega dados de atividades"""
-        try:
-            files = self.find_files("*_summarizedActivities.json")
-            if not files:
-                return None
-            
-            with open(files[0], 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            activities = data[0]['summarizedActivitiesExport']
-            
-            if not activities:
-                return None
-            
-            df = pd.DataFrame(activities)
-            
-            # Converter timestamps de forma segura
-            # Atividades usam timestamps em milissegundos (números)
-            if 'startTimeLocal' in df.columns:
-                df['startTimeLocal'] = self.safe_parse_timestamp(df['startTimeLocal'], 'startTimeLocal')
-            elif 'startTimeGmt' in df.columns:
-                df['startTimeLocal'] = self.safe_parse_timestamp(df['startTimeGmt'], 'startTimeGmt')
-            elif 'beginTimestamp' in df.columns:
-                df['startTimeLocal'] = self.safe_parse_timestamp(df['beginTimestamp'], 'beginTimestamp')
-            else:
-                st.error("Coluna de data não encontrada nas atividades")
-                return None
-            
-            # Debug: verificar conversão
-            if df['startTimeLocal'].notna().any():
-                min_date = df['startTimeLocal'].min()
-                max_date = df['startTimeLocal'].max()
-                if pd.notna(min_date) and pd.notna(max_date):
-                    st.success(f"✅ Atividades carregadas: {len(df)} registros de {min_date.strftime('%d/%m/%Y')} até {max_date.strftime('%d/%m/%Y')}")
-            
-            # Remover linhas com datas inválidas
-            df = df.dropna(subset=['startTimeLocal'])
-            
-            if len(df) == 0:
-                return None
-            
-            df['date'] = df['startTimeLocal'].dt.date
-            df['month'] = df['startTimeLocal'].dt.to_period('M')
-            df['week'] = df['startTimeLocal'].dt.to_period('W')
-            df['year'] = df['startTimeLocal'].dt.year
-            df['weekday'] = df['startTimeLocal'].dt.day_name()
-            df['hour'] = df['startTimeLocal'].dt.hour
-            
-            # Converter duração para minutos com verificação
-            # No Garmin, elapsedDuration e movingDuration vêm em MILISSEGUNDOS
-            # Preferir elapsedDuration (tempo total) ou usar duration como fallback
-            if 'elapsedDuration' in df.columns:
-                df['duration_seconds'] = df['elapsedDuration'].fillna(0) / 1000
-                df['duration_minutes'] = df['duration_seconds'] / 60
-            elif 'duration' in df.columns:
-                df['duration_seconds'] = df['duration'].fillna(0) / 1000
-                df['duration_minutes'] = df['duration_seconds'] / 60
-            else:
-                df['duration_seconds'] = 0
-                df['duration_minutes'] = 0
-            
-            # Converter distância para km com verificação
-            # No Garmin, distance vem em CENTÍMETROS
-            if 'distance' in df.columns:
-                df['distance_meters'] = df['distance'].fillna(0) / 100
-                df['distance_km'] = df['distance_meters'] / 1000
-            else:
-                df['distance_meters'] = 0
-                df['distance_km'] = 0
-            
-            # Preencher valores nulos em colunas importantes
-            # No Garmin, bmrCalories contém as calorias reais da atividade
-            # (o campo 'calories' geralmente tem valores inflados/incorretos)
-            if 'bmrCalories' in df.columns:
-                df['bmrCalories'] = df['bmrCalories'].fillna(0)
-                df['activeCalories'] = df['bmrCalories']  # Usar bmrCalories como calorias ativas
-            elif 'calories' in df.columns:
-                df['calories'] = df['calories'].fillna(0)
-                df['activeCalories'] = df['calories']
-            else:
-                df['activeCalories'] = 0
-                
-            if 'avgHr' in df.columns:
-                df['avgHr'] = df['avgHr'].fillna(0)
-            else:
-                df['avgHr'] = 0
-            
-            # Traduzir tipos de atividade
-            activity_translations = {
-                'walking': 'Caminhada',
-                'running': 'Corrida',
-                'cycling': 'Ciclismo',
-                'swimming': 'Natação',
-                'strength_training': 'Musculação',
-                'yoga': 'Yoga',
-                'hiking': 'Trilha',
-                'gym': 'Academia',
-                'fitness_equipment': 'Equipamento Fitness',
-                'cardio': 'Cardio',
-                'other': 'Outros'
-            }
-            
-            if 'activityType' in df.columns:
-                df['activityType'] = df['activityType'].replace(activity_translations)
-                # Manter original se não foi traduzido
-                df['activityType'] = df['activityType'].fillna('Outros')
-            else:
-                df['activityType'] = 'Atividade'
-            
-            self.activities_df = df
-            return df
-            
-        except Exception as e:
-            st.error(f"Erro ao carregar atividades: {str(e)}")
-            import traceback
-            st.error(f"Detalhes: {traceback.format_exc()}")
-            return None
-    
-    def load_sleep(self):
-        """Carrega dados de sono"""
-        try:
-            files = self.find_files("*_sleepData.json")
-            if not files:
-                return None
-            
-            all_sleep = []
-            for file in files:
-                with open(file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    all_sleep.extend(data)
-            
-            if not all_sleep:
-                return None
-            
-            df = pd.DataFrame(all_sleep)
-            
-            # Converter timestamps de forma segura
-            df['calendarDate'] = pd.to_datetime(df['calendarDate'], errors='coerce')
-            
-            if 'sleepStartTimestampGMT' in df.columns:
-                df['sleepStartTimestampGMT'] = self.safe_parse_timestamp(
-                    df['sleepStartTimestampGMT'], 
-                    'sleepStartTimestampGMT'
-                )
-            
-            if 'sleepEndTimestampGMT' in df.columns:
-                df['sleepEndTimestampGMT'] = self.safe_parse_timestamp(
-                    df['sleepEndTimestampGMT'], 
-                    'sleepEndTimestampGMT'
-                )
-            
-            # Converter segundos para horas (com verificação de existência)
-            if 'deepSleepSeconds' in df.columns:
-                df['deepSleepHours'] = df['deepSleepSeconds'].fillna(0) / 3600
-            else:
-                df['deepSleepHours'] = 0
-                
-            if 'lightSleepSeconds' in df.columns:
-                df['lightSleepHours'] = df['lightSleepSeconds'].fillna(0) / 3600
-            else:
-                df['lightSleepHours'] = 0
-                
-            if 'remSleepSeconds' in df.columns:
-                df['remSleepHours'] = df['remSleepSeconds'].fillna(0) / 3600
-            else:
-                df['remSleepHours'] = 0
-                
-            if 'awakeSleepSeconds' in df.columns:
-                df['awakeHours'] = df['awakeSleepSeconds'].fillna(0) / 3600
-            else:
-                df['awakeHours'] = 0
-            
-            df['totalSleepHours'] = df['deepSleepHours'] + df['lightSleepHours'] + df['remSleepHours']
-            
-            # Remover linhas com datas inválidas
-            df = df.dropna(subset=['calendarDate'])
-            
-            if len(df) == 0:
-                return None
-            
-            # Debug: verificar conversão
-            if df['calendarDate'].notna().any():
-                min_date = df['calendarDate'].min()
-                max_date = df['calendarDate'].max()
-                if pd.notna(min_date) and pd.notna(max_date):
-                    st.success(f"✅ Dados de sono carregados: {len(df)} registros de {min_date.strftime('%d/%m/%Y')} até {max_date.strftime('%d/%m/%Y')}")
-            
-            # Adicionar períodos temporais
-            df['month'] = df['calendarDate'].dt.to_period('M')
-            df['week'] = df['calendarDate'].dt.to_period('W')
-            df['year'] = df['calendarDate'].dt.year
-            df['weekday'] = df['calendarDate'].dt.day_name()
-            
-            # Extrair sleep scores se existirem
-            if 'sleepScores' in df.columns:
-                df['overallScore'] = df['sleepScores'].apply(
-                    lambda x: x.get('overallScore') if isinstance(x, dict) else None
-                )
-                df['qualityScore'] = df['sleepScores'].apply(
-                    lambda x: x.get('qualityScore') if isinstance(x, dict) else None
-                )
-                df['recoveryScore'] = df['sleepScores'].apply(
-                    lambda x: x.get('recoveryScore') if isinstance(x, dict) else None
-                )
-                df['durationScore'] = df['sleepScores'].apply(
-                    lambda x: x.get('durationScore') if isinstance(x, dict) else None
-                )
-                df['deepScore'] = df['sleepScores'].apply(
-                    lambda x: x.get('deepScore') if isinstance(x, dict) else None
-                )
-                df['remScore'] = df['sleepScores'].apply(
-                    lambda x: x.get('remScore') if isinstance(x, dict) else None
-                )
-            
-            # Preencher valores faltantes
-            if 'awakeCount' not in df.columns:
-                df['awakeCount'] = 0
-            else:
-                df['awakeCount'] = df['awakeCount'].fillna(0)
-            
-            self.sleep_df = df
-            return df
-            
-        except Exception as e:
-            st.error(f"Erro ao carregar dados de sono: {str(e)}")
-            import traceback
-            st.error(f"Detalhes: {traceback.format_exc()}")
-            return None
-    
-    def load_health(self):
-        """Carrega dados de saúde"""
-        try:
-            files = self.find_files("*_healthStatusData.json")
-            if not files:
-                return None
-            
-            all_health = []
-            for file in files:
-                with open(file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    all_health.extend(data)
-            
-            if not all_health:
-                return None
-            
-            # Expandir métricas
-            metrics_expanded = []
-            for record in all_health:
-                metrics_dict = {
-                    'calendarDate': record.get('calendarDate'),
-                    'createTimestampUTC': record.get('createTimestampUTC'),
-                    'updateTimestampUTC': record.get('updateTimestampUTC')
-                }
-                
-                # Extrair métricas por tipo
-                if 'metrics' in record and isinstance(record['metrics'], list):
-                    for metric in record['metrics']:
-                        if isinstance(metric, dict):
-                            metric_type = metric.get('type', 'unknown')
-                            metrics_dict[f'{metric_type}_value'] = metric.get('value')
-                            metrics_dict[f'{metric_type}_baseline_upper'] = metric.get('baselineUpperLimit')
-                            metrics_dict[f'{metric_type}_baseline_lower'] = metric.get('baselineLowerLimit')
-                            metrics_dict[f'{metric_type}_percentage'] = metric.get('percentage')
-                            metrics_dict[f'{metric_type}_status'] = metric.get('status')
-                
-                metrics_expanded.append(metrics_dict)
-            
-            df = pd.DataFrame(metrics_expanded)
-            df['calendarDate'] = pd.to_datetime(df['calendarDate'], errors='coerce')
-            
-            # Remover linhas com datas inválidas
-            df = df.dropna(subset=['calendarDate'])
-            
-            if len(df) == 0:
-                return None
-            
-            df['month'] = df['calendarDate'].dt.to_period('M')
-            df['week'] = df['calendarDate'].dt.to_period('W')
-            df['year'] = df['calendarDate'].dt.year
-            df['weekday'] = df['calendarDate'].dt.day_name()
-            
-            self.health_df = df
-            return df
-            
-        except Exception as e:
-            st.error(f"Erro ao carregar dados de saúde: {str(e)}")
-            import traceback
-            st.error(f"Detalhes: {traceback.format_exc()}")
-            return None
-    
-    def load_hydration(self):
-        """Carrega dados de hidratação"""
-        try:
-            files = self.find_files("HydrationLogFile*.json")
-            if not files:
-                return None
-            
-            all_hydration = []
-            for file in files:
-                with open(file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        all_hydration.extend(data)
-            
-            if not all_hydration:
-                return None
-            
-            df = pd.DataFrame(all_hydration)
-            
-            # Converter timestamps se existirem
-            if 'timestampGMT' in df.columns:
-                df['timestamp'] = self.safe_parse_timestamp(df['timestampGMT'], 'timestampGMT')
-                df['date'] = df['timestamp'].dt.date
-                df['month'] = df['timestamp'].dt.to_period('M')
-                df['week'] = df['timestamp'].dt.to_period('W')
-            
-            self.hydration_df = df
-            return df
-            
-        except Exception as e:
-            st.error(f"Erro ao carregar dados de hidratação: {str(e)}")
-            import traceback
-            st.error(f"Detalhes: {traceback.format_exc()}")
-            return None
-    
-    def load_body_battery_and_stress(self):
-        """Carrega dados de Body Battery e Estresse dos arquivos UDS"""
-        try:
-            files = self.find_files("UDSFile*.json")
-            if not files:
-                return None, None
-            
-            all_data = []
-            for file in files:
-                with open(file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        all_data.extend(data)
-            
-            if not all_data:
-                return None, None
-            
-            # Processar Body Battery
-            body_battery_records = []
-            stress_records = []
-            
-            for record in all_data:
-                calendar_date = record.get('calendarDate')
-                
-                # Body Battery
-                if 'bodyBattery' in record and record['bodyBattery']:
-                    bb_data = record['bodyBattery']
-                    bb_record = {
-                        'calendarDate': calendar_date,
-                        'chargedValue': bb_data.get('chargedValue'),
-                        'drainedValue': bb_data.get('drainedValue'),
-                        'bodyBatteryVersion': bb_data.get('bodyBatteryVersion')
-                    }
-                    
-                    # Extrair estatísticas
-                    if 'bodyBatteryStatList' in bb_data:
-                        for stat in bb_data['bodyBatteryStatList']:
-                            stat_type = stat.get('bodyBatteryStatType')
-                            if stat_type:
-                                bb_record[f'{stat_type.lower()}_value'] = stat.get('statsValue')
-                                bb_record[f'{stat_type.lower()}_timestamp'] = stat.get('statTimestamp')
-                    
-                    body_battery_records.append(bb_record)
-                
-                # Estresse
-                if 'allDayStress' in record and record['allDayStress']:
-                    stress_data = record['allDayStress']
-                    
-                    if 'aggregatorList' in stress_data:
-                        for agg in stress_data['aggregatorList']:
-                            stress_record = {
-                                'calendarDate': calendar_date,
-                                'type': agg.get('type'),
-                                'averageStressLevel': agg.get('averageStressLevel'),
-                                'maxStressLevel': agg.get('maxStressLevel'),
-                                'restDuration': agg.get('restDuration', 0) / 60,  # Converter para minutos
-                                'activityDuration': agg.get('activityDuration', 0) / 60,
-                                'lowDuration': agg.get('lowDuration', 0) / 60,
-                                'mediumDuration': agg.get('mediumDuration', 0) / 60,
-                                'highDuration': agg.get('highDuration', 0) / 60,
-                                'totalDuration': agg.get('totalDuration', 0) / 60
-                            }
-                            stress_records.append(stress_record)
-            
-            # Criar DataFrames
-            bb_df = None
-            if body_battery_records:
-                bb_df = pd.DataFrame(body_battery_records)
-                bb_df['calendarDate'] = pd.to_datetime(bb_df['calendarDate'], errors='coerce')
-                bb_df = bb_df.dropna(subset=['calendarDate'])
-                bb_df['month'] = bb_df['calendarDate'].dt.to_period('M')
-                bb_df['week'] = bb_df['calendarDate'].dt.to_period('W')
-                bb_df['year'] = bb_df['calendarDate'].dt.year
-                bb_df['weekday'] = bb_df['calendarDate'].dt.day_name()
-            
-            stress_df = None
-            if stress_records:
-                stress_df = pd.DataFrame(stress_records)
-                stress_df['calendarDate'] = pd.to_datetime(stress_df['calendarDate'], errors='coerce')
-                stress_df = stress_df.dropna(subset=['calendarDate'])
-                stress_df['month'] = stress_df['calendarDate'].dt.to_period('M')
-                stress_df['week'] = stress_df['calendarDate'].dt.to_period('W')
-                stress_df['year'] = stress_df['calendarDate'].dt.year
-                stress_df['weekday'] = stress_df['calendarDate'].dt.day_name()
-            
-            return bb_df, stress_df
-            
-        except Exception as e:
-            st.error(f"Erro ao carregar dados de Body Battery e Estresse: {str(e)}")
-            import traceback
-            st.error(f"Detalhes: {traceback.format_exc()}")
-            return None, None
-    
-    def load_all_data(self):
-        """Carrega todos os dados"""
-        self.extract_zip()
-        self.load_activities()
-        self.load_sleep()
-        self.load_health()
-        self.load_hydration()
-        
-        # Carregar Body Battery e Estresse
-        self.body_battery_df, self.stress_df = self.load_body_battery_and_stress()
+# ============================================================== carregamento
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_zip_bytes(data: bytes) -> GarminExport:
+    tmp = Path(tempfile.mkdtemp(prefix="garmin_zip_")) / "export.zip"
+    tmp.write_bytes(data)
+    return GarminExport(tmp).load()
 
 
-def create_activities_overview(df):
-    """Cria visão geral das atividades"""
-    st.header("📊 Visão Geral das Atividades")
-    
-    if df is None or len(df) == 0:
-        st.warning("Nenhuma atividade encontrada nos dados")
-        return
-    
-    # Filtros de período
-    st.subheader("🔍 Filtros de Período")
-    
-    col_filter1, col_filter2, col_filter3, col_filter4 = st.columns(4)
-    
-    with col_filter1:
-        # Filtro de ano
-        anos_disponiveis = ['Todos'] + sorted(df['year'].unique().tolist(), reverse=True)
-        ano_selecionado = st.selectbox("📅 Ano", anos_disponiveis, key="overview_year")
-    
-    with col_filter2:
-        # Filtro de mês
-        if ano_selecionado != 'Todos':
-            df_ano = df[df['year'] == ano_selecionado]
-            meses_disponiveis = ['Todos'] + sorted(df_ano['month'].astype(str).unique().tolist(), reverse=True)
-        else:
-            meses_disponiveis = ['Todos'] + sorted(df['month'].astype(str).unique().tolist(), reverse=True)
-        mes_selecionado = st.selectbox("📆 Mês", meses_disponiveis, key="overview_month")
-    
-    with col_filter3:
-        # Filtro de semana (mais útil quando mês está selecionado)
-        if mes_selecionado != 'Todos':
-            df_filtrado = df[df['month'].astype(str) == mes_selecionado] if ano_selecionado == 'Todos' else df[(df['year'] == ano_selecionado) & (df['month'].astype(str) == mes_selecionado)]
-            semanas_disponiveis = ['Todas'] + sorted(df_filtrado['week'].astype(str).unique().tolist(), reverse=True)
-        else:
-            semanas_disponiveis = ['Todas']
-        semana_selecionada = st.selectbox("📅 Semana", semanas_disponiveis, key="overview_week")
-    
-    with col_filter4:
-        # Filtro de tipo de atividade
-        tipos_disponiveis = ['Todos'] + sorted(df['activityType'].unique().tolist())
-        tipo_selecionado = st.selectbox("🏃 Tipo de Atividade", tipos_disponiveis, key="overview_type")
-    
-    # Aplicar filtros
-    df_filtered = df.copy()
-    
-    if ano_selecionado != 'Todos':
-        df_filtered = df_filtered[df_filtered['year'] == ano_selecionado]
-    
-    if mes_selecionado != 'Todos':
-        df_filtered = df_filtered[df_filtered['month'].astype(str) == mes_selecionado]
-    
-    if semana_selecionada != 'Todas':
-        df_filtered = df_filtered[df_filtered['week'].astype(str) == semana_selecionada]
-    
-    if tipo_selecionado != 'Todos':
-        df_filtered = df_filtered[df_filtered['activityType'] == tipo_selecionado]
-    
-    # Mostrar período selecionado
-    if len(df_filtered) > 0:
-        periodo_inicio = df_filtered['startTimeLocal'].min().strftime('%d/%m/%Y')
-        periodo_fim = df_filtered['startTimeLocal'].max().strftime('%d/%m/%Y')
-        
-        # Calcular percentual do total
-        percentual = (len(df_filtered) / len(df)) * 100
-        
-        col_info1, col_info2 = st.columns([2, 1])
-        with col_info1:
-            st.info(f"📊 Mostrando **{len(df_filtered)}** de **{len(df)}** atividades ({percentual:.1f}%) | Período: {periodo_inicio} até {periodo_fim}")
-        
-        with col_info2:
-            if st.button("🔄 Limpar Filtros", key="clear_filters_overview"):
-                st.rerun()
-    else:
-        st.warning("⚠️ Nenhuma atividade encontrada com os filtros selecionados")
-        return
-    
-    st.markdown("---")
-    
-    # Métricas principais (usando dados filtrados)
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        total_activities = len(df_filtered)
-        st.metric("Total de Atividades", f"{total_activities}")
-    
-    with col2:
-        total_distance = df_filtered['distance_km'].sum()
-        st.metric("Distância Total", f"{total_distance:.1f} km")
-    
-    with col3:
-        if 'activeCalories' in df_filtered.columns:
-            active_calories = df_filtered['activeCalories'].sum()
-            st.metric("Calorias", f"{active_calories:_.0f}".replace('_', '.'))
-        else:
-            total_calories = df_filtered['calories'].sum()
-            st.metric("Calorias", f"{total_calories:_.0f}".replace('_', '.'))
-    
-    with col4:
-        total_time = df_filtered['duration_minutes'].sum()
-        st.metric("Tempo Total", f"{total_time/60:.1f}h")
-    
-    with col5:
-        avg_hr = df_filtered[df_filtered['avgHr'] > 0]['avgHr'].mean() if (df_filtered['avgHr'] > 0).any() else 0
-        st.metric("FC Média", f"{avg_hr:.0f} bpm" if avg_hr > 0 else "N/A")
-    
-    st.markdown("---")
-    
-    # Gráficos em linha
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Atividades por tipo
-        if 'activityType' in df_filtered.columns:
-            activity_counts = df_filtered['activityType'].value_counts()
-            fig = px.pie(
-                values=activity_counts.values,
-                names=activity_counts.index,
-                title="Distribuição por Tipo de Atividade",
-                hole=0.4,
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            fig.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Atividades por dia da semana
-        weekday_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        weekday_map = {
-            'Monday': 'Segunda',
-            'Tuesday': 'Terça',
-            'Wednesday': 'Quarta',
-            'Thursday': 'Quinta',
-            'Friday': 'Sexta',
-            'Saturday': 'Sábado',
-            'Sunday': 'Domingo'
-        }
-        
-        weekday_counts = df_filtered['weekday'].value_counts().reindex(weekday_order, fill_value=0)
-        weekday_counts.index = weekday_counts.index.map(weekday_map)
-        
-        fig = px.bar(
-            x=weekday_counts.index,
-            y=weekday_counts.values,
-            title="Atividades por Dia da Semana",
-            labels={'x': 'Dia', 'y': 'Quantidade'},
-            color=weekday_counts.values,
-            color_continuous_scale='Viridis'
-        )
-        st.plotly_chart(fig, use_container_width=True)
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_folder(path: str, mtime: float) -> GarminExport:
+    return GarminExport(path).load()
 
 
-def create_activities_temporal_analysis(df):
-    """Cria análise temporal das atividades"""
-    st.header("📈 Análise Temporal das Atividades")
-    
-    # Filtros
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col1:
-        time_period = st.selectbox(
-            "Selecione o período:",
-            ["Diário", "Semanal", "Mensal", "Anual"],
-            key="temporal_period"
-        )
-    
-    with col2:
-        # Filtro por tipo de atividade
-        tipos_disponiveis = ['Todos'] + sorted(df['activityType'].unique().tolist())
-        tipo_selecionado = st.selectbox(
-            "🏃 Tipo de Atividade:",
-            tipos_disponiveis,
-            key="temporal_type"
-        )
-    
-    with col3:
-        # Mostrar info do filtro
-        if tipo_selecionado != 'Todos':
-            st.info(f"Filtrando: {tipo_selecionado}")
-    
-    # Aplicar filtro de tipo
-    if tipo_selecionado != 'Todos':
-        df = df[df['activityType'] == tipo_selecionado].copy()
-        
-        if len(df) == 0:
-            st.warning(f"⚠️ Nenhuma atividade do tipo '{tipo_selecionado}' encontrada")
-            return
-    
-    # Decidir qual coluna de calorias usar
-    calorie_col = 'activeCalories' if 'activeCalories' in df.columns else 'calories'
-    
-    # Função para criar lista de atividades
-    def get_activities_list(group):
-        activities = []
-        for _, row in group.iterrows():
-            act_name = row.get('name', row.get('activityType', 'Atividade'))
-            act_time = row['startTimeLocal'].strftime('%H:%M') if 'startTimeLocal' in row else ''
-            activities.append(f"{act_time} {act_name}" if act_time else act_name)
-        return '<br>'.join(activities[:5]) + ('<br>...' if len(activities) > 5 else '')
-    
-    # Preparar dados baseado no período
-    if time_period == "Diário":
-        grouped = df.groupby('date').agg({
-            'activityId': 'count',
-            'distance_km': 'sum',
-            calorie_col: 'sum',
-            'duration_minutes': 'sum',
-            'avgHr': 'mean'
-        }).reset_index()
-        
-        # Adicionar lista de atividades
-        activities_list = df.groupby('date').apply(get_activities_list).reset_index()
-        activities_list.columns = ['date', 'activities_detail']
-        grouped = grouped.merge(activities_list, left_on='date', right_on='date', how='left')
-        
-        grouped.columns = ['Data', 'Atividades', 'Distância (km)', 'Calorias', 'Duração (min)', 'FC Média', 'Detalhes']
-        x_col = 'Data'
-        
-    elif time_period == "Semanal":
-        grouped = df.groupby('week').agg({
-            'activityId': 'count',
-            'distance_km': 'sum',
-            calorie_col: 'sum',
-            'duration_minutes': 'sum',
-            'avgHr': 'mean'
-        }).reset_index()
-        
-        # Adicionar lista de atividades
-        activities_list = df.groupby('week').apply(get_activities_list).reset_index()
-        activities_list.columns = ['week', 'activities_detail']
-        grouped = grouped.merge(activities_list, left_on='week', right_on='week', how='left')
-        
-        grouped['week'] = grouped['week'].astype(str)
-        grouped.columns = ['Semana', 'Atividades', 'Distância (km)', 'Calorias', 'Duração (min)', 'FC Média', 'Detalhes']
-        x_col = 'Semana'
-        
-    elif time_period == "Mensal":
-        grouped = df.groupby('month').agg({
-            'activityId': 'count',
-            'distance_km': 'sum',
-            calorie_col: 'sum',
-            'duration_minutes': 'sum',
-            'avgHr': 'mean'
-        }).reset_index()
-        
-        # Adicionar lista de atividades
-        activities_list = df.groupby('month').apply(get_activities_list).reset_index()
-        activities_list.columns = ['month', 'activities_detail']
-        grouped = grouped.merge(activities_list, left_on='month', right_on='month', how='left')
-        
-        grouped['month'] = grouped['month'].astype(str)
-        grouped.columns = ['Mês', 'Atividades', 'Distância (km)', 'Calorias', 'Duração (min)', 'FC Média', 'Detalhes']
-        x_col = 'Mês'
-        
-    else:  # Anual
-        grouped = df.groupby('year').agg({
-            'activityId': 'count',
-            'distance_km': 'sum',
-            calorie_col: 'sum',
-            'duration_minutes': 'sum',
-            'avgHr': 'mean'
-        }).reset_index()
-        
-        # Adicionar lista de atividades
-        activities_list = df.groupby('year').apply(get_activities_list).reset_index()
-        activities_list.columns = ['year', 'activities_detail']
-        grouped = grouped.merge(activities_list, left_on='year', right_on='year', how='left')
-        
-        grouped.columns = ['Ano', 'Atividades', 'Distância (km)', 'Calorias', 'Duração (min)', 'FC Média', 'Detalhes']
-        x_col = 'Ano'
-    
-    # Criar gráficos
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        fig = px.line(
-            grouped,
-            x=x_col,
-            y='Distância (km)',
-            title=f"Distância Total - {time_period}",
-            markers=True,
-            line_shape='spline',
-            custom_data=['Atividades', 'Calorias', 'Duração (min)', 'Detalhes']
-        )
-        fig.update_traces(
-            line_color='#00C9FF', 
-            marker=dict(size=8),
-            hovertemplate='<b>%{x}</b><br>' +
-                         'Distância: %{y:.1f} km<br>' +
-                         'Atividades: %{customdata[0]}<br>' +
-                         'Calorias: %{customdata[1]:.0f}<br>' +
-                         'Duração: %{customdata[2]:.0f} min<br>' +
-                         '<br><b>Detalhes:</b><br>%{customdata[3]}<extra></extra>'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        fig = px.bar(
-            grouped,
-            x=x_col,
-            y='Calorias',
-            title=f"Calorias - {time_period}",
-            color='Calorias',
-            color_continuous_scale='Reds',
-            custom_data=['Atividades', 'Distância (km)', 'Duração (min)', 'Detalhes']
-        )
-        fig.update_traces(
-            hovertemplate='<b>%{x}</b><br>' +
-                         'Calorias: %{y:.0f}<br>' +
-                         'Atividades: %{customdata[0]}<br>' +
-                         'Distância: %{customdata[1]:.1f} km<br>' +
-                         'Duração: %{customdata[2]:.0f} min<br>' +
-                         '<br><b>Detalhes:</b><br>%{customdata[3]}<extra></extra>'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    col3, col4 = st.columns(2)
-    
-    with col3:
-        fig = px.area(
-            grouped,
-            x=x_col,
-            y='Duração (min)',
-            title=f"Tempo de Treino - {time_period}",
-            color_discrete_sequence=['#92FE9D'],
-            custom_data=['Atividades', 'Distância (km)', 'Calorias', 'Detalhes']
-        )
-        fig.update_traces(
-            hovertemplate='<b>%{x}</b><br>' +
-                         'Duração: %{y:.0f} min<br>' +
-                         'Atividades: %{customdata[0]}<br>' +
-                         'Distância: %{customdata[1]:.1f} km<br>' +
-                         'Calorias: %{customdata[2]:.0f}<br>' +
-                         '<br><b>Detalhes:</b><br>%{customdata[3]}<extra></extra>'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col4:
-        fig = px.line(
-            grouped,
-            x=x_col,
-            y='FC Média',
-            title=f"Frequência Cardíaca Média - {time_period}",
-            markers=True,
-            line_shape='spline',
-            custom_data=['Atividades', 'Distância (km)', 'Calorias', 'Duração (min)', 'Detalhes']
-        )
-        fig.update_traces(
-            line_color='#FF6B6B', 
-            marker=dict(size=8),
-            hovertemplate='<b>%{x}</b><br>' +
-                         'FC Média: %{y:.0f} bpm<br>' +
-                         'Atividades: %{customdata[0]}<br>' +
-                         'Distância: %{customdata[1]:.1f} km<br>' +
-                         'Calorias: %{customdata[2]:.0f}<br>' +
-                         'Duração: %{customdata[3]:.0f} min<br>' +
-                         '<br><b>Detalhes:</b><br>%{customdata[4]}<extra></extra>'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-
-def create_activities_detailed_analysis(df):
-    """Cria análise detalhada das atividades"""
-    st.header("🔍 Análise Detalhada das Atividades")
-    
-    # Filtros
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if 'activityType' in df.columns:
-            activity_types = ['Todos'] + list(df['activityType'].unique())
-            selected_type = st.selectbox("Tipo de Atividade:", activity_types)
-    
-    with col2:
-        years = ['Todos'] + sorted(df['year'].unique().tolist(), reverse=True)
-        selected_year = st.selectbox("Ano:", years)
-    
-    with col3:
-        months = ['Todos'] + sorted(df['month'].astype(str).unique().tolist(), reverse=True)
-        selected_month = st.selectbox("Mês:", months)
-    
-    # Aplicar filtros
-    filtered_df = df.copy()
-    
-    if selected_type != 'Todos':
-        filtered_df = filtered_df[filtered_df['activityType'] == selected_type]
-    
-    if selected_year != 'Todos':
-        filtered_df = filtered_df[filtered_df['year'] == selected_year]
-    
-    if selected_month != 'Todos':
-        filtered_df = filtered_df[filtered_df['month'].astype(str) == selected_month]
-    
-    st.markdown("---")
-    
-    # Estatísticas filtradas
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Atividades", len(filtered_df))
-    
-    with col2:
-        st.metric("Distância Total", f"{filtered_df['distance_km'].sum():.1f} km")
-    
-    with col3:
-        if 'activeCalories' in filtered_df.columns:
-            active_cal = filtered_df['activeCalories'].sum()
-            st.metric("Calorias", f"{active_cal:_.0f}".replace('_', '.'))
-        else:
-            st.metric("Calorias", f"{filtered_df['calories'].sum():_.0f}".replace('_', '.'))
-    
-    with col4:
-        total_time = filtered_df['duration_minutes'].sum()
-        st.metric("Tempo Total", f"{total_time/60:.1f}h")
-    
-    # Gráficos avançados
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Distribuição de duração
-        fig = px.histogram(
-            filtered_df,
-            x='duration_minutes',
-            title="Distribuição de Duração das Atividades",
-            labels={'duration_minutes': 'Duração (minutos)', 'count': 'Frequência'},
-            color_discrete_sequence=['#667eea'],
-            nbins=30
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Scatter: Distância vs Calorias
-        calorie_col = 'activeCalories' if 'activeCalories' in filtered_df.columns else 'calories'
-        
-        fig = px.scatter(
-            filtered_df,
-            x='distance_km',
-            y=calorie_col,
-            title="Relação: Distância vs Calorias",
-            labels={'distance_km': 'Distância (km)', calorie_col: 'Calorias'},
-            color='duration_minutes',
-            size='duration_minutes',
-            color_continuous_scale='Viridis',
-            hover_data=['activityType', 'avgHr']
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Gráficos adicionais
-    st.markdown("---")
-    
-    # Evolução temporal e FC
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Evolução temporal das atividades
-        if len(filtered_df) > 1:
-            temporal_df = filtered_df.sort_values('startTimeLocal')
-            temporal_df['data_formatada'] = temporal_df['startTimeLocal'].dt.strftime('%d/%m')
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=temporal_df['data_formatada'],
-                y=temporal_df['distance_km'],
-                name='Distância (km)',
-                mode='lines+markers',
-                line=dict(color='#00C9FF', width=2),
-                marker=dict(size=8)
-            ))
-            
-            fig.update_layout(
-                title="Evolução: Distância por Atividade",
-                xaxis_title="Data",
-                yaxis_title="Distância (km)",
-                hovermode='x unified'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Análise de Frequência Cardíaca
-        if 'avgHr' in filtered_df.columns and (filtered_df['avgHr'] > 0).any():
-            hr_data = filtered_df[filtered_df['avgHr'] > 0]
-            
-            fig = px.box(
-                hr_data,
-                y='avgHr',
-                x='activityType' if selected_type == 'Todos' else None,
-                title="Distribuição de Frequência Cardíaca",
-                labels={'avgHr': 'FC Média (bpm)', 'activityType': 'Tipo'},
-                color='activityType' if selected_type == 'Todos' else None,
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # Performance por tipo de atividade
-    if selected_type == 'Todos' and len(filtered_df['activityType'].unique()) > 1:
-        st.subheader("📊 Performance por Tipo de Atividade")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Calorias por tipo
-            cal_by_type = filtered_df.groupby('activityType').agg({
-                'activeCalories' if 'activeCalories' in filtered_df.columns else 'calories': 'mean'
-            }).reset_index()
-            cal_by_type.columns = ['Tipo', 'Calorias Médias']
-            cal_by_type = cal_by_type.sort_values('Calorias Médias', ascending=True)
-            
-            fig = px.bar(
-                cal_by_type,
-                y='Tipo',
-                x='Calorias Médias',
-                title="Calorias Médias por Tipo",
-                orientation='h',
-                color='Calorias Médias',
-                color_continuous_scale='Reds'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # Duração média por tipo
-            dur_by_type = filtered_df.groupby('activityType')['duration_minutes'].mean().reset_index()
-            dur_by_type.columns = ['Tipo', 'Duração Média (min)']
-            dur_by_type = dur_by_type.sort_values('Duração Média (min)', ascending=True)
-            
-            fig = px.bar(
-                dur_by_type,
-                y='Tipo',
-                x='Duração Média (min)',
-                title="Duração Média por Tipo",
-                orientation='h',
-                color='Duração Média (min)',
-                color_continuous_scale='Greens'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # Mapa de calor: Hora do dia vs Dia da semana
-    if len(filtered_df) > 0:
-        st.subheader("🕐 Mapa de Calor: Quando Você Treina?")
-        
-        weekday_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        weekday_map = {
-            'Monday': 'Seg',
-            'Tuesday': 'Ter',
-            'Wednesday': 'Qua',
-            'Thursday': 'Qui',
-            'Friday': 'Sex',
-            'Saturday': 'Sáb',
-            'Sunday': 'Dom'
-        }
-        
-        heatmap_data = filtered_df.groupby(['weekday', 'hour']).size().reset_index(name='count')
-        heatmap_pivot = heatmap_data.pivot(index='weekday', columns='hour', values='count').fillna(0)
-        heatmap_pivot = heatmap_pivot.reindex(weekday_order)
-        heatmap_pivot.index = heatmap_pivot.index.map(weekday_map)
-        
-        fig = px.imshow(
-            heatmap_pivot,
-            title="Atividades por Dia da Semana e Hora",
-            labels=dict(x="Hora do Dia", y="Dia da Semana", color="Quantidade"),
-            color_continuous_scale='YlOrRd',
-            aspect='auto'
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-
-def create_sleep_analysis(df):
-    """Cria análise de sono"""
-    st.header("😴 Análise de Sono")
-    
-    if df is None or len(df) == 0:
-        st.warning("Dados de sono não disponíveis")
-        return
-    
-    # Filtros de período
-    st.subheader("🔍 Filtros de Período")
-    
-    col_filter1, col_filter2, col_filter3 = st.columns(3)
-    
-    with col_filter1:
-        # Filtro de ano
-        anos_disponiveis = ['Todos'] + sorted(df['year'].unique().tolist(), reverse=True)
-        ano_selecionado = st.selectbox("📅 Ano", anos_disponiveis, key="sleep_year")
-    
-    with col_filter2:
-        # Filtro de mês
-        if ano_selecionado != 'Todos':
-            df_ano = df[df['year'] == ano_selecionado]
-            meses_disponiveis = ['Todos'] + sorted(df_ano['month'].astype(str).unique().tolist(), reverse=True)
-        else:
-            meses_disponiveis = ['Todos'] + sorted(df['month'].astype(str).unique().tolist(), reverse=True)
-        mes_selecionado = st.selectbox("📆 Mês", meses_disponiveis, key="sleep_month")
-    
-    with col_filter3:
-        # Filtro de semana
-        if mes_selecionado != 'Todos':
-            df_filtrado = df[df['month'].astype(str) == mes_selecionado] if ano_selecionado == 'Todos' else df[(df['year'] == ano_selecionado) & (df['month'].astype(str) == mes_selecionado)]
-            semanas_disponiveis = ['Todas'] + sorted(df_filtrado['week'].astype(str).unique().tolist(), reverse=True)
-        else:
-            semanas_disponiveis = ['Todas']
-        semana_selecionada = st.selectbox("📅 Semana", semanas_disponiveis, key="sleep_week")
-    
-    # Aplicar filtros
-    df_filtered = df.copy()
-    
-    if ano_selecionado != 'Todos':
-        df_filtered = df_filtered[df_filtered['year'] == ano_selecionado]
-    
-    if mes_selecionado != 'Todos':
-        df_filtered = df_filtered[df_filtered['month'].astype(str) == mes_selecionado]
-    
-    if semana_selecionada != 'Todas':
-        df_filtered = df_filtered[df_filtered['week'].astype(str) == semana_selecionada]
-    
-    # Mostrar período selecionado
-    if len(df_filtered) > 0:
-        periodo_inicio = df_filtered['calendarDate'].min().strftime('%d/%m/%Y')
-        periodo_fim = df_filtered['calendarDate'].max().strftime('%d/%m/%Y')
-        
-        # Calcular percentual do total
-        percentual = (len(df_filtered) / len(df)) * 100
-        
-        col_info1, col_info2 = st.columns([2, 1])
-        with col_info1:
-            st.info(f"📊 Mostrando **{len(df_filtered)}** de **{len(df)}** noites ({percentual:.1f}%) | Período: {periodo_inicio} até {periodo_fim}")
-        
-        with col_info2:
-            if st.button("🔄 Limpar Filtros", key="clear_filters_sleep"):
-                st.rerun()
-    else:
-        st.warning("⚠️ Nenhum registro de sono encontrado com os filtros selecionados")
-        return
-    
-    st.markdown("---")
-    
-    # Métricas principais (usando dados filtrados)
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        avg_sleep = df_filtered['totalSleepHours'].mean()
-        st.metric("Sono Médio", f"{avg_sleep:.1f}h" if avg_sleep > 0 else "N/A")
-    
-    with col2:
-        avg_deep = df_filtered['deepSleepHours'].mean()
-        st.metric("Sono Profundo", f"{avg_deep:.1f}h" if avg_deep > 0 else "N/A")
-    
-    with col3:
-        avg_rem = df_filtered['remSleepHours'].mean()
-        st.metric("Sono REM", f"{avg_rem:.1f}h" if avg_rem > 0 else "N/A")
-    
-    with col4:
-        avg_awake = df_filtered['awakeCount'].mean()
-        st.metric("Despertares", f"{avg_awake:.1f}" if avg_awake > 0 else "N/A")
-    
-    with col5:
-        if 'overallScore' in df_filtered.columns and df_filtered['overallScore'].notna().any():
-            avg_score = df_filtered['overallScore'].dropna().mean()
-            st.metric("Score Médio", f"{avg_score:.0f}" if avg_score > 0 else "N/A")
-        else:
-            st.metric("Score Médio", "N/A")
-    
-    st.markdown("---")
-    
-    # Gráficos de sono
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Evolução do sono
-        sleep_trend = df_filtered.sort_values('calendarDate')[['calendarDate', 'totalSleepHours']]
-        fig = px.line(
-            sleep_trend,
-            x='calendarDate',
-            y='totalSleepHours',
-            title="Evolução do Sono",
-            labels={'calendarDate': 'Data', 'totalSleepHours': 'Horas de Sono'},
-            markers=True
-        )
-        fig.add_hline(y=7, line_dash="dash", line_color="green", 
-                     annotation_text="Meta: 7h")
-        fig.update_traces(line_color='#4B0082')
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Distribuição das fases do sono
-        sleep_phases = pd.DataFrame({
-            'Fase': ['Sono Profundo', 'Sono Leve', 'Sono REM', 'Acordado'],
-            'Horas': [
-                df_filtered['deepSleepHours'].mean(),
-                df_filtered['lightSleepHours'].mean(),
-                df_filtered['remSleepHours'].mean(),
-                df_filtered['awakeHours'].mean()
-            ]
-        })
-        
-        fig = px.bar(
-            sleep_phases,
-            x='Fase',
-            y='Horas',
-            title="Distribuição Média das Fases do Sono",
-            color='Fase',
-            color_discrete_map={
-                'Sono Profundo': '#1E3A8A',
-                'Sono Leve': '#60A5FA',
-                'Sono REM': '#A78BFA',
-                'Acordado': '#FCA5A5'
-            }
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Análise semanal
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Sono por dia da semana
-        weekday_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        weekday_map = {
-            'Monday': 'Segunda',
-            'Tuesday': 'Terça',
-            'Wednesday': 'Quarta',
-            'Thursday': 'Quinta',
-            'Friday': 'Sexta',
-            'Saturday': 'Sábado',
-            'Sunday': 'Domingo'
-        }
-        
-        weekday_sleep = df_filtered.groupby('weekday')['totalSleepHours'].mean().reindex(weekday_order)
-        weekday_sleep.index = weekday_sleep.index.map(weekday_map)
-        
-        fig = px.bar(
-            x=weekday_sleep.index,
-            y=weekday_sleep.values,
-            title="Sono Médio por Dia da Semana",
-            labels={'x': 'Dia', 'y': 'Horas de Sono'},
-            color=weekday_sleep.values,
-            color_continuous_scale='Blues'
-        )
-        fig.update_traces(hovertemplate='<b>%{x}</b><br>Sono: %{y:.1f}h<extra></extra>')
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        # Score de sono ao longo do tempo
-        if 'overallScore' in df_filtered.columns and df_filtered['overallScore'].notna().any():
-            score_trend = df_filtered.dropna(subset=['overallScore']).sort_values('calendarDate')[['calendarDate', 'overallScore']]
-            if len(score_trend) > 0:
-                fig = px.line(
-                    score_trend,
-                    x='calendarDate',
-                    y='overallScore',
-                    title="Evolução do Score de Sono",
-                    labels={'calendarDate': 'Data', 'overallScore': 'Score'},
-                    markers=True
-                )
-                fig.update_traces(line_color='#10B981', marker=dict(size=8))
-                st.plotly_chart(fig, use_container_width=True)
-    
-    # Análise de respiração
-    if 'averageRespiration' in df_filtered.columns and df_filtered['averageRespiration'].notna().any():
-        st.subheader("📊 Análise Respiratória Durante o Sono")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            avg_resp = df_filtered['averageRespiration'].dropna().mean()
-            
-            if avg_resp > 0:
-                fig = go.Figure()
-                fig.add_trace(go.Indicator(
-                    mode="gauge+number",
-                    value=avg_resp,
-                    title={'text': "Respiração Média (rpm)"},
-                    gauge={
-                        'axis': {'range': [None, 25]},
-                        'bar': {'color': "#00C9FF"},
-                        'steps': [
-                            {'range': [0, 12], 'color': "lightgray"},
-                            {'range': [12, 20], 'color': "gray"}
-                        ],
-                        'threshold': {
-                            'line': {'color': "red", 'width': 4},
-                            'thickness': 0.75,
-                            'value': 20
-                        }
-                    }
-                ))
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            resp_data = df_filtered.dropna(subset=['averageRespiration']).sort_values('calendarDate')[['calendarDate', 'averageRespiration']]
-            if len(resp_data) > 0:
-                fig = px.line(
-                    resp_data,
-                    x='calendarDate',
-                    y='averageRespiration',
-                    title="Evolução da Respiração Média",
-                    labels={'calendarDate': 'Data', 'averageRespiration': 'Respiração (rpm)'},
-                    markers=True
-                )
-                fig.update_traces(line_color='#FF6B6B')
-                st.plotly_chart(fig, use_container_width=True)
-
-
-def create_health_analysis(df, body_battery_df=None, stress_df=None):
-    """Cria análise de saúde"""
-    st.header("💗 Análise de Saúde")
-    
-    if df is None or len(df) == 0:
-        st.warning("Dados de saúde não disponíveis")
-        return
-    
-    st.markdown("""
-    Esta seção mostra suas **métricas de saúde** coletadas pelo Garmin, incluindo:
-    - **HRV** (Variabilidade da Frequência Cardíaca): Indicador de estresse e recuperação
-    - **HR** (Frequência Cardíaca em Repouso): Medida de saúde cardiovascular
-    - **SPO2** (Saturação de Oxigênio): Percentual de oxigênio no sangue
-    - **Temperatura da Pele**: Variação em relação à sua linha de base
-    - **Respiração**: Taxa respiratória em repouso
-    """)
-    
-    st.markdown("---")
-    
-    # Filtros de período
-    st.subheader("🔍 Filtros de Período")
-    
-    col_filter1, col_filter2, col_filter3 = st.columns(3)
-    
-    with col_filter1:
-        # Filtro de ano
-        anos_disponiveis = ['Todos'] + sorted(df['year'].unique().tolist(), reverse=True)
-        ano_selecionado = st.selectbox("📅 Ano", anos_disponiveis, key="health_year")
-    
-    with col_filter2:
-        # Filtro de mês
-        if ano_selecionado != 'Todos':
-            df_ano = df[df['year'] == ano_selecionado]
-            meses_disponiveis = ['Todos'] + sorted(df_ano['month'].astype(str).unique().tolist(), reverse=True)
-        else:
-            meses_disponiveis = ['Todos'] + sorted(df['month'].astype(str).unique().tolist(), reverse=True)
-        mes_selecionado = st.selectbox("📆 Mês", meses_disponiveis, key="health_month")
-    
-    with col_filter3:
-        # Filtro de semana
-        if mes_selecionado != 'Todos':
-            df_filtrado = df[df['month'].astype(str) == mes_selecionado] if ano_selecionado == 'Todos' else df[(df['year'] == ano_selecionado) & (df['month'].astype(str) == mes_selecionado)]
-            semanas_disponiveis = ['Todas'] + sorted(df_filtrado['week'].astype(str).unique().tolist(), reverse=True)
-        else:
-            semanas_disponiveis = ['Todas']
-        semana_selecionada = st.selectbox("📅 Semana", semanas_disponiveis, key="health_week")
-    
-    # Aplicar filtros
-    df_filtered = df.copy()
-    
-    if ano_selecionado != 'Todos':
-        df_filtered = df_filtered[df_filtered['year'] == ano_selecionado]
-    
-    if mes_selecionado != 'Todos':
-        df_filtered = df_filtered[df_filtered['month'].astype(str) == mes_selecionado]
-    
-    if semana_selecionada != 'Todas':
-        df_filtered = df_filtered[df_filtered['week'].astype(str) == semana_selecionada]
-    
-    # Aplicar filtros em Body Battery e Estresse
-    bb_filtered = None
-    if body_battery_df is not None and len(body_battery_df) > 0:
-        bb_filtered = body_battery_df.copy()
-        if ano_selecionado != 'Todos':
-            bb_filtered = bb_filtered[bb_filtered['year'] == ano_selecionado]
-        if mes_selecionado != 'Todos':
-            bb_filtered = bb_filtered[bb_filtered['month'].astype(str) == mes_selecionado]
-        if semana_selecionada != 'Todas':
-            bb_filtered = bb_filtered[bb_filtered['week'].astype(str) == semana_selecionada]
-    
-    stress_filtered = None
-    if stress_df is not None and len(stress_df) > 0:
-        stress_filtered = stress_df.copy()
-        if ano_selecionado != 'Todos':
-            stress_filtered = stress_filtered[stress_filtered['year'] == ano_selecionado]
-        if mes_selecionado != 'Todos':
-            stress_filtered = stress_filtered[stress_filtered['month'].astype(str) == mes_selecionado]
-        if semana_selecionada != 'Todas':
-            stress_filtered = stress_filtered[stress_filtered['week'].astype(str) == semana_selecionada]
-    
-    # Mostrar período selecionado
-    if len(df_filtered) > 0:
-        periodo_inicio = df_filtered['calendarDate'].min().strftime('%d/%m/%Y')
-        periodo_fim = df_filtered['calendarDate'].max().strftime('%d/%m/%Y')
-        
-        # Calcular percentual do total
-        percentual = (len(df_filtered) / len(df)) * 100
-        
-        col_info1, col_info2 = st.columns([2, 1])
-        with col_info1:
-            st.info(f"📊 Mostrando **{len(df_filtered)}** de **{len(df)}** registros ({percentual:.1f}%) | Período: {periodo_inicio} até {periodo_fim}")
-        
-        with col_info2:
-            if st.button("🔄 Limpar Filtros", key="clear_filters_health"):
-                st.rerun()
-    else:
-        st.warning("⚠️ Nenhum registro de saúde encontrado com os filtros selecionados")
-        return
-    
-    st.markdown("---")
-    
-    # Body Battery (movido para o início)
-    if bb_filtered is not None and len(bb_filtered) > 0:
-        st.subheader("🔋 Body Battery")
-        
-        st.markdown("""
-        O **Body Battery** mede sua energia corporal em uma escala de 0-100, 
-        mostrando quanto você se recupera durante o descanso e quanto energia você gasta durante atividades.
-        """)
-        
-        # Métricas principais
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            if 'highest_value' in bb_filtered.columns and bb_filtered['highest_value'].notna().any():
-                avg_highest = bb_filtered['highest_value'].mean()
-                st.metric("Valor Máximo Médio", f"{avg_highest:.0f}")
-            else:
-                st.metric("Valor Máximo Médio", "N/A")
-        
-        with col2:
-            if 'lowest_value' in bb_filtered.columns and bb_filtered['lowest_value'].notna().any():
-                avg_lowest = bb_filtered['lowest_value'].mean()
-                st.metric("Valor Mínimo Médio", f"{avg_lowest:.0f}")
-            else:
-                st.metric("Valor Mínimo Médio", "N/A")
-        
-        with col3:
-            if 'chargedValue' in bb_filtered.columns and bb_filtered['chargedValue'].notna().any():
-                avg_charged = bb_filtered['chargedValue'].mean()
-                st.metric("Recarga Média", f"+{avg_charged:.0f}")
-            else:
-                st.metric("Recarga Média", "N/A")
-        
-        with col4:
-            if 'drainedValue' in bb_filtered.columns and bb_filtered['drainedValue'].notna().any():
-                avg_drained = bb_filtered['drainedValue'].mean()
-                st.metric("Gasto Médio", f"-{avg_drained:.0f}")
-            else:
-                st.metric("Gasto Médio", "N/A")
-        
-        # Gráficos
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Evolução do Body Battery (valores máximo e mínimo diários)
-            if 'highest_value' in bb_filtered.columns and 'lowest_value' in bb_filtered.columns:
-                fig = go.Figure()
-                
-                # Área entre máximo e mínimo
-                fig.add_trace(go.Scatter(
-                    x=bb_filtered['calendarDate'],
-                    y=bb_filtered['highest_value'],
-                    mode='lines',
-                    name='Máximo',
-                    line=dict(color='#10B981', width=0),
-                    showlegend=False
-                ))
-                
-                fig.add_trace(go.Scatter(
-                    x=bb_filtered['calendarDate'],
-                    y=bb_filtered['lowest_value'],
-                    mode='lines',
-                    name='Mínimo',
-                    line=dict(color='#10B981', width=0),
-                    fillcolor='rgba(16, 185, 129, 0.3)',
-                    fill='tonexty',
-                    showlegend=False
-                ))
-                
-                # Linhas de máximo e mínimo
-                fig.add_trace(go.Scatter(
-                    x=bb_filtered['calendarDate'],
-                    y=bb_filtered['highest_value'],
-                    mode='lines+markers',
-                    name='Máximo Diário',
-                    line=dict(color='#10B981', width=2),
-                    marker=dict(size=6)
-                ))
-                
-                fig.add_trace(go.Scatter(
-                    x=bb_filtered['calendarDate'],
-                    y=bb_filtered['lowest_value'],
-                    mode='lines+markers',
-                    name='Mínimo Diário',
-                    line=dict(color='#EF4444', width=2),
-                    marker=dict(size=6)
-                ))
-                
-                # Linhas de referência
-                fig.add_hline(y=75, line_dash="dash", line_color="green", 
-                             annotation_text="Alto (75)", annotation_position="right")
-                fig.add_hline(y=50, line_dash="dash", line_color="orange", 
-                             annotation_text="Moderado (50)", annotation_position="right")
-                fig.add_hline(y=25, line_dash="dash", line_color="red", 
-                             annotation_text="Baixo (25)", annotation_position="right")
-                
-                fig.update_layout(
-                    title="Evolução do Body Battery",
-                    xaxis_title="Data",
-                    yaxis_title="Body Battery (0-100)",
-                    hovermode='x unified',
-                    yaxis=dict(range=[0, 100])
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # Gráfico de Carga vs Descarga
-            if 'chargedValue' in bb_filtered.columns and 'drainedValue' in bb_filtered.columns:
-                fig = go.Figure()
-                
-                fig.add_trace(go.Bar(
-                    x=bb_filtered['calendarDate'],
-                    y=bb_filtered['chargedValue'],
-                    name='Recarga',
-                    marker_color='#10B981'
-                ))
-                
-                fig.add_trace(go.Bar(
-                    x=bb_filtered['calendarDate'],
-                    y=-bb_filtered['drainedValue'],
-                    name='Gasto',
-                    marker_color='#EF4444'
-                ))
-                
-                fig.update_layout(
-                    title="Recarga vs Gasto de Energia",
-                    xaxis_title="Data",
-                    yaxis_title="Energia",
-                    barmode='relative',
-                    hovermode='x unified'
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-        
-        # Análise por dia da semana
-        if 'weekday' in bb_filtered.columns:
-            weekday_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-            weekday_map = {
-                'Monday': 'Segunda', 'Tuesday': 'Terça', 'Wednesday': 'Quarta',
-                'Thursday': 'Quinta', 'Friday': 'Sexta', 'Saturday': 'Sábado', 'Sunday': 'Domingo'
-            }
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if 'highest_value' in bb_filtered.columns:
-                    weekday_bb = bb_filtered.groupby('weekday')['highest_value'].mean().reindex(weekday_order)
-                    weekday_bb.index = weekday_bb.index.map(weekday_map)
-                    
-                    fig = px.bar(
-                        x=weekday_bb.index,
-                        y=weekday_bb.values,
-                        title="Body Battery Máximo Médio por Dia da Semana",
-                        labels={'x': 'Dia', 'y': 'Body Battery'},
-                        color=weekday_bb.values,
-                        color_continuous_scale='Greens'
-                    )
-                    fig.update_traces(hovertemplate='<b>%{x}</b><br>Body Battery: %{y:.0f}<extra></extra>')
-                    st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                if 'chargedValue' in bb_filtered.columns:
-                    weekday_charge = bb_filtered.groupby('weekday')['chargedValue'].mean().reindex(weekday_order)
-                    weekday_charge.index = weekday_charge.index.map(weekday_map)
-                    
-                    fig = px.bar(
-                        x=weekday_charge.index,
-                        y=weekday_charge.values,
-                        title="Recarga Média por Dia da Semana",
-                        labels={'x': 'Dia', 'y': 'Recarga'},
-                        color=weekday_charge.values,
-                        color_continuous_scale='Blues'
-                    )
-                    fig.update_traces(hovertemplate='<b>%{x}</b><br>Recarga: +%{y:.0f}<extra></extra>')
-                    st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown("---")
-    
-    # Estresse (movido para logo após Body Battery)
-    if stress_filtered is not None and len(stress_filtered) > 0:
-        st.subheader("😰 Análise de Estresse")
-        
-        st.markdown("""
-        O **nível de estresse** é medido em uma escala de 0-100, onde:
-        - **0-25**: Descanso
-        - **26-50**: Baixo estresse
-        - **51-75**: Médio estresse
-        - **76-100**: Alto estresse
-        """)
-        
-        # Filtrar dados TOTAL (todos os períodos do dia)
-        stress_total = stress_filtered[stress_filtered['type'] == 'TOTAL'].copy()
-        
-        if len(stress_total) > 0:
-            # Métricas principais
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                avg_stress = stress_total['averageStressLevel'].mean()
-                st.metric("Estresse Médio", f"{avg_stress:.0f}")
-            
-            with col2:
-                max_stress = stress_total['maxStressLevel'].mean()
-                st.metric("Estresse Máximo Médio", f"{max_stress:.0f}")
-            
-            with col3:
-                rest_time = stress_total['restDuration'].mean()
-                st.metric("Tempo de Descanso", f"{rest_time:.0f} min/dia")
-            
-            with col4:
-                activity_time = stress_total['activityDuration'].mean()
-                st.metric("Tempo em Atividade", f"{activity_time:.0f} min/dia")
-            
-            # Gráficos
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Evolução do estresse
-                stress_data = stress_total[['calendarDate', 'averageStressLevel']].copy()
-                
-                fig = px.line(
-                    stress_data,
-                    x='calendarDate',
-                    y='averageStressLevel',
-                    title="Evolução do Nível de Estresse",
-                    labels={'calendarDate': 'Data', 'averageStressLevel': 'Nível de Estresse'},
-                    markers=True
-                )
-                
-                # Linhas de referência
-                fig.add_hline(y=25, line_dash="dash", line_color="green", 
-                             annotation_text="Descanso (25)")
-                fig.add_hline(y=50, line_dash="dash", line_color="orange", 
-                             annotation_text="Médio (50)")
-                fig.add_hline(y=75, line_dash="dash", line_color="red", 
-                             annotation_text="Alto (75)")
-                
-                fig.update_traces(line_color='#F97316')
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Distribuição do tempo por nível de estresse
-                avg_durations = {
-                    'Descanso': stress_total['restDuration'].mean(),
-                    'Baixo': stress_total['lowDuration'].mean(),
-                    'Médio': stress_total['mediumDuration'].mean(),
-                    'Alto': stress_total['highDuration'].mean(),
-                    'Atividade': stress_total['activityDuration'].mean()
-                }
-                
-                fig = go.Figure(data=[go.Pie(
-                    labels=list(avg_durations.keys()),
-                    values=list(avg_durations.values()),
-                    marker=dict(colors=['#10B981', '#FCD34D', '#F59E0B', '#EF4444', '#3B82F6']),
-                    hole=0.4
-                )])
-                
-                fig.update_layout(
-                    title="Distribuição Média do Tempo por Nível de Estresse",
-                    annotations=[dict(text='Tempo<br>Diário', x=0.5, y=0.5, font_size=14, showarrow=False)]
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Análise por dia da semana
-            if 'weekday' in stress_total.columns:
-                weekday_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-                weekday_map = {
-                    'Monday': 'Segunda', 'Tuesday': 'Terça', 'Wednesday': 'Quarta',
-                    'Thursday': 'Quinta', 'Friday': 'Sexta', 'Saturday': 'Sábado', 'Sunday': 'Domingo'
-                }
-                
-                weekday_stress = stress_total.groupby('weekday')['averageStressLevel'].mean().reindex(weekday_order)
-                weekday_stress.index = weekday_stress.index.map(weekday_map)
-                
-                fig = px.bar(
-                    x=weekday_stress.index,
-                    y=weekday_stress.values,
-                    title="Nível de Estresse Médio por Dia da Semana",
-                    labels={'x': 'Dia', 'y': 'Nível de Estresse'},
-                    color=weekday_stress.values,
-                    color_continuous_scale='RdYlGn_r'
-                )
-                fig.update_traces(hovertemplate='<b>%{x}</b><br>Estresse: %{y:.0f}<extra></extra>')
-                st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown("---")
-    
-    # Métricas principais (usando dados filtrados)
-    st.subheader("📊 Métricas Atuais")
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    metric_configs = [
-        ('HRV', 'HRV', 'ms', col1, '#FF6B6B'),
-        ('HR', 'FC Repouso', 'bpm', col2, '#4ECDC4'),
-        ('SPO2', 'SpO₂', '%', col3, '#45B7D1'),
-        ('SKIN_TEMP_C', 'Temp. Pele', '°C', col4, '#FFA07A'),
-        ('RESPIRATION', 'Respiração', 'rpm', col5, '#98D8C8')
-    ]
-    
-    for metric_key, label, unit, col, color in metric_configs:
-        with col:
-            value_col = f'{metric_key}_value'
-            if value_col in df_filtered.columns and df_filtered[value_col].notna().any():
-                latest_value = df_filtered[value_col].dropna().iloc[-1]
-                avg_value = df_filtered[value_col].mean()
-                delta = latest_value - avg_value
-                
-                # Formatar temperatura com + ou -
-                if metric_key == 'SKIN_TEMP_C':
-                    st.metric(label, f"{latest_value:+.1f}{unit}", f"{delta:+.1f}{unit}")
-                else:
-                    st.metric(label, f"{latest_value:.1f} {unit}", f"{delta:+.1f}")
-            else:
-                st.metric(label, "N/A", "")
-    
-    st.markdown("---")
-    
-    # Gráficos de evolução
-    st.subheader("📈 Evolução das Métricas")
-    
-    # HRV e Frequência Cardíaca
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if 'HRV_value' in df_filtered.columns and df_filtered['HRV_value'].notna().any():
-            hrv_data = df_filtered[['calendarDate', 'HRV_value', 'HRV_baseline_upper', 'HRV_baseline_lower']].dropna(subset=['HRV_value'])
-            
-            fig = go.Figure()
-            
-            # Linha principal
-            fig.add_trace(go.Scatter(
-                x=hrv_data['calendarDate'],
-                y=hrv_data['HRV_value'],
-                mode='lines+markers',
-                name='HRV',
-                line=dict(color='#FF6B6B', width=2),
-                marker=dict(size=6)
-            ))
-            
-            # Linhas de base
-            if 'HRV_baseline_upper' in hrv_data.columns and hrv_data['HRV_baseline_upper'].notna().any():
-                fig.add_trace(go.Scatter(
-                    x=hrv_data['calendarDate'],
-                    y=hrv_data['HRV_baseline_upper'],
-                    mode='lines',
-                    name='Limite Superior',
-                    line=dict(color='rgba(255,107,107,0.3)', dash='dash')
-                ))
-            
-            if 'HRV_baseline_lower' in hrv_data.columns and hrv_data['HRV_baseline_lower'].notna().any():
-                fig.add_trace(go.Scatter(
-                    x=hrv_data['calendarDate'],
-                    y=hrv_data['HRV_baseline_lower'],
-                    mode='lines',
-                    name='Limite Inferior',
-                    line=dict(color='rgba(255,107,107,0.3)', dash='dash')
-                ))
-            
-            fig.update_layout(
-                title="Variabilidade da Frequência Cardíaca (HRV)",
-                xaxis_title="Data",
-                yaxis_title="HRV (ms)",
-                hovermode='x unified'
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        if 'HR_value' in df_filtered.columns and df_filtered['HR_value'].notna().any():
-            hr_data = df_filtered[['calendarDate', 'HR_value', 'HR_baseline_upper', 'HR_baseline_lower']].dropna(subset=['HR_value'])
-            
-            fig = go.Figure()
-            
-            fig.add_trace(go.Scatter(
-                x=hr_data['calendarDate'],
-                y=hr_data['HR_value'],
-                mode='lines+markers',
-                name='FC Repouso',
-                line=dict(color='#4ECDC4', width=2),
-                marker=dict(size=6)
-            ))
-            
-            if 'HR_baseline_upper' in hr_data.columns and hr_data['HR_baseline_upper'].notna().any():
-                fig.add_trace(go.Scatter(
-                    x=hr_data['calendarDate'],
-                    y=hr_data['HR_baseline_upper'],
-                    mode='lines',
-                    name='Limite Superior',
-                    line=dict(color='rgba(78,205,196,0.3)', dash='dash')
-                ))
-            
-            if 'HR_baseline_lower' in hr_data.columns and hr_data['HR_baseline_lower'].notna().any():
-                fig.add_trace(go.Scatter(
-                    x=hr_data['calendarDate'],
-                    y=hr_data['HR_baseline_lower'],
-                    mode='lines',
-                    name='Limite Inferior',
-                    line=dict(color='rgba(78,205,196,0.3)', dash='dash')
-                ))
-            
-            fig.update_layout(
-                title="Frequência Cardíaca em Repouso",
-                xaxis_title="Data",
-                yaxis_title="FC (bpm)",
-                hovermode='x unified'
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # SpO2 e Temperatura
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if 'SPO2_value' in df_filtered.columns and df_filtered['SPO2_value'].notna().any():
-            spo2_data = df_filtered[['calendarDate', 'SPO2_value']].dropna(subset=['SPO2_value'])
-            
-            fig = px.line(
-                spo2_data,
-                x='calendarDate',
-                y='SPO2_value',
-                title="Saturação de Oxigênio (SpO₂)",
-                labels={'calendarDate': 'Data', 'SPO2_value': 'SpO₂ (%)'},
-                markers=True
-            )
-            
-            # Adicionar linha de referência
-            fig.add_hline(y=95, line_dash="dash", line_color="green", 
-                         annotation_text="Normal: ≥95%")
-            
-            fig.update_traces(line_color='#45B7D1', marker=dict(size=6))
-            st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        if 'SKIN_TEMP_C_value' in df_filtered.columns and df_filtered['SKIN_TEMP_C_value'].notna().any():
-            temp_data = df_filtered[['calendarDate', 'SKIN_TEMP_C_value']].dropna(subset=['SKIN_TEMP_C_value'])
-            
-            fig = px.line(
-                temp_data,
-                x='calendarDate',
-                y='SKIN_TEMP_C_value',
-                title="Variação da Temperatura da Pele",
-                labels={'calendarDate': 'Data', 'SKIN_TEMP_C_value': 'Variação (°C)'},
-                markers=True
-            )
-            
-            # Adicionar linha de referência
-            fig.add_hline(y=0, line_dash="dash", line_color="gray", 
-                         annotation_text="Linha de Base")
-            
-            fig.update_traces(line_color='#FFA07A', marker=dict(size=6))
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # Taxa Respiratória
-    if 'RESPIRATION_value' in df_filtered.columns and df_filtered['RESPIRATION_value'].notna().any():
-        st.subheader("🫁 Taxa Respiratória")
-        
-        resp_data = df_filtered[['calendarDate', 'RESPIRATION_value']].dropna(subset=['RESPIRATION_value'])
-        
-        fig = px.line(
-            resp_data,
-            x='calendarDate',
-            y='RESPIRATION_value',
-            title="Evolução da Taxa Respiratória em Repouso",
-            labels={'calendarDate': 'Data', 'RESPIRATION_value': 'Respiração (rpm)'},
-            markers=True
-        )
-        
-        # Adicionar faixa normal
-        fig.add_hrect(y0=12, y1=20, line_width=0, fillcolor="green", opacity=0.1,
-                      annotation_text="Faixa Normal", annotation_position="top left")
-        
-        fig.update_traces(line_color='#98D8C8', marker=dict(size=6))
-        st.plotly_chart(fig, use_container_width=True)
-    
-    # Análise de tendências
-    st.markdown("---")
-    st.subheader("📊 Resumo Estatístico")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    stats_data = []
-    for metric_key, label, unit, _, _ in metric_configs:
-        value_col = f'{metric_key}_value'
-        if value_col in df_filtered.columns and df_filtered[value_col].notna().any():
-            values = df_filtered[value_col].dropna()
-            stats_data.append({
-                'Métrica': label,
-                'Média': f"{values.mean():.1f} {unit}",
-                'Mínimo': f"{values.min():.1f} {unit}",
-                'Máximo': f"{values.max():.1f} {unit}",
-                'Desvio Padrão': f"{values.std():.1f} {unit}"
-            })
-    
-    if stats_data:
-        stats_df = pd.DataFrame(stats_data)
-        st.dataframe(stats_df, use_container_width=True, hide_index=True)
-
-
-def create_correlation_analysis(activities_df, sleep_df, body_battery_df=None, stress_df=None, health_df=None):
-    """Cria análise de correlação completa entre todos os dados"""
-    st.header("🔗 Análise de Correlações e Padrões")
-    
-    st.markdown("""
-    Esta seção analisa **relações e padrões** entre suas atividades, sono, energia e estresse,
-    ajudando você a entender como cada aspecto impacta o outro.
-    """)
-    
-    if activities_df is None or sleep_df is None:
-        st.warning("Dados insuficientes para análise de correlação")
-        return
-    
-    if len(activities_df) == 0 or len(sleep_df) == 0:
-        st.warning("Dados insuficientes para análise de correlação")
-        return
-    
-    st.markdown("---")
-    
-    # === 1. PREPARAR DADOS CONSOLIDADOS ===
-    try:
-        # Agregar atividades por data
-        calorie_col = 'activeCalories' if 'activeCalories' in activities_df.columns else 'calories'
-        
-        agg_dict = {
-            'activityId': 'count',
-            'distance_km': 'sum',
-            calorie_col: 'sum',
-            'duration_minutes': 'sum'
-        }
-        
-        # Adicionar averageHR apenas se existir
-        if 'averageHR' in activities_df.columns:
-            agg_dict['averageHR'] = 'mean'
-        
-        activities_daily = activities_df.groupby('date').agg(agg_dict).reset_index()
-        
-        # Renomear colunas dinamicamente
-        col_names = ['date', 'num_activities', 'distance', 'calories', 'duration']
-        if 'averageHR' in activities_df.columns:
-            col_names.append('avg_hr')
-        
-        activities_daily.columns = col_names
-        
-        # Dados de sono
-        sleep_daily = sleep_df[['calendarDate', 'totalSleepHours', 'deepSleepHours', 'remSleepHours', 'awakeCount']].copy()
-        sleep_daily['date'] = sleep_daily['calendarDate'].dt.date
-        if 'overallScore' in sleep_df.columns:
-            sleep_daily['sleepScore'] = sleep_df['overallScore']
-        sleep_daily = sleep_daily.dropna(subset=['totalSleepHours'])
-        sleep_daily = sleep_daily.drop(columns=['calendarDate'])  # Remover para evitar duplicatas
-        
-        # Merge básico
-        merged = pd.merge(activities_daily, sleep_daily, on='date', how='outer')
-        
-        # Body Battery
-        if body_battery_df is not None and len(body_battery_df) > 0:
-            bb_daily = body_battery_df[['calendarDate', 'chargedValue', 'drainedValue', 'highest_value', 'lowest_value']].copy()
-            bb_daily['date'] = bb_daily['calendarDate'].dt.date
-            bb_daily = bb_daily.drop(columns=['calendarDate'])  # Remover para evitar duplicatas
-            merged = pd.merge(merged, bb_daily, on='date', how='outer')
-        
-        # Estresse
-        if stress_df is not None and len(stress_df) > 0:
-            stress_total = stress_df[stress_df['type'] == 'TOTAL'].copy()
-            stress_daily = stress_total[['calendarDate', 'averageStressLevel', 'restDuration']].copy()
-            stress_daily['date'] = stress_daily['calendarDate'].dt.date
-            stress_daily = stress_daily.drop(columns=['calendarDate'])  # Remover para evitar duplicatas
-            merged = pd.merge(merged, stress_daily, on='date', how='outer')
-        
-        # Saúde (HRV, FC em repouso)
-        if health_df is not None and len(health_df) > 0:
-            health_cols = ['calendarDate']
-            if 'HRV_value' in health_df.columns:
-                health_cols.append('HRV_value')
-            if 'HR_value' in health_df.columns:
-                health_cols.append('HR_value')
-            
-            health_daily = health_df[health_cols].copy()
-            health_daily['date'] = health_daily['calendarDate'].dt.date
-            health_daily = health_daily.drop(columns=['calendarDate'])  # Remover para evitar duplicatas
-            merged = pd.merge(merged, health_daily, on='date', how='outer')
-        
-        merged = merged.dropna(subset=['date'])
-        
-        if len(merged) < 5:
-            st.warning("Dados insuficientes para análise de correlação (necessário ao menos 5 dias com dados)")
-            return
-            
-    except Exception as e:
-        st.error(f"Erro ao processar dados para correlação: {str(e)}")
-        return
-    
-    # === 2. ATIVIDADE VS SONO ===
-    st.subheader("🏃 Atividade vs 😴 Sono")
-    
-    activity_sleep_data = merged.dropna(subset=['calories', 'totalSleepHours', 'deepSleepHours'])
-    
-    if len(activity_sleep_data) >= 5:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = px.scatter(
-                activity_sleep_data,
-                x='duration',
-                y='totalSleepHours',
-                title="Duração do Treino vs Horas de Sono",
-                labels={'duration': 'Duração do Treino (min)', 'totalSleepHours': 'Horas de Sono'},
-                color='calories',
-                size='distance',
-                color_continuous_scale='Viridis'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = px.scatter(
-                activity_sleep_data,
-                x='calories',
-                y='deepSleepHours',
-                title="Calorias vs Sono Profundo",
-                labels={'calories': 'Calorias', 'deepSleepHours': 'Sono Profundo (h)'},
-                color='totalSleepHours',
-                color_continuous_scale='Blues'
-            )
-            st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown("---")
-    
-    # === 3. BODY BATTERY E RECUPERAÇÃO ===
-    if body_battery_df is not None and 'chargedValue' in merged.columns:
-        st.subheader("🔋 Energy e Recuperação")
-        
-        bb_data = merged.dropna(subset=['chargedValue', 'totalSleepHours', 'deepSleepHours'])
-        
-        if len(bb_data) >= 5:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig = px.scatter(
-                    bb_data,
-                    x='totalSleepHours',
-                    y='chargedValue',
-                    title="Horas de Sono vs Recarga de Energia",
-                    labels={'totalSleepHours': 'Horas de Sono', 'chargedValue': 'Recarga (Body Battery)'},
-                    color='deepSleepHours',
-                    color_continuous_scale='Greens'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                fig = px.scatter(
-                    bb_data,
-                    x='calories',
-                    y='drainedValue',
-                    title="Calorias vs Gasto de Energia",
-                    labels={'calories': 'Calorias Gastas', 'drainedValue': 'Descarga (Body Battery)'},
-                    color='duration',
-                    color_continuous_scale='Reds'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown("---")
-    
-    # === 4. ESTRESSE E ATIVIDADE ===
-    if stress_df is not None and 'averageStressLevel' in merged.columns:
-        st.subheader("😰 Estresse vs Atividade")
-        
-        stress_data = merged.dropna(subset=['averageStressLevel', 'calories'])
-        
-        if len(stress_data) >= 5:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig = px.scatter(
-                    stress_data,
-                    x='calories',
-                    y='averageStressLevel',
-                    title="Atividade vs Nível de Estresse",
-                    labels={'calories': 'Calorias Gastas', 'averageStressLevel': 'Nível de Estresse'},
-                    color='duration',
-                    color_continuous_scale='Oranges'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                fig = px.scatter(
-                    stress_data,
-                    x='restDuration',
-                    y='totalSleepHours',
-                    title="Tempo de Descanso vs Sono",
-                    labels={'restDuration': 'Tempo de Descanso (min)', 'totalSleepHours': 'Horas de Sono'},
-                    color='averageStressLevel',
-                    color_continuous_scale='RdYlGn_r'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown("---")
-    
-    # === 5. HRV E RECUPERAÇÃO ===
-    if health_df is not None and 'HRV_value' in merged.columns:
-        st.subheader("❤️ HRV e Recuperação")
-        
-        hrv_data = merged.dropna(subset=['HRV_value', 'totalSleepHours'])
-        
-        if len(hrv_data) >= 5:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig = px.scatter(
-                    hrv_data,
-                    x='totalSleepHours',
-                    y='HRV_value',
-                    title="Sono vs HRV (Variabilidade Cardíaca)",
-                    labels={'totalSleepHours': 'Horas de Sono', 'HRV_value': 'HRV (ms)'},
-                    color='deepSleepHours',
-                    color_continuous_scale='Purples'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                if 'averageStressLevel' in hrv_data.columns:
-                    fig = px.scatter(
-                        hrv_data,
-                        x='averageStressLevel',
-                        y='HRV_value',
-                        title="Estresse vs HRV",
-                        labels={'averageStressLevel': 'Nível de Estresse', 'HRV_value': 'HRV (ms)'},
-                        color='totalSleepHours',
-                        color_continuous_scale='RdYlGn'
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-        
-        st.markdown("---")
-    
-    # === 6. MATRIZ DE CORRELAÇÃO ===
-    st.subheader("📊 Matriz de Correlação Geral")
-    
-    # Selecionar colunas disponíveis para correlação
-    corr_cols = []
-    corr_labels = {}
-    
-    if 'duration' in merged.columns:
-        corr_cols.append('duration')
-        corr_labels['duration'] = 'Duração Treino'
-    if 'calories' in merged.columns:
-        corr_cols.append('calories')
-        corr_labels['calories'] = 'Calorias'
-    if 'distance' in merged.columns:
-        corr_cols.append('distance')
-        corr_labels['distance'] = 'Distância'
-    if 'totalSleepHours' in merged.columns:
-        corr_cols.append('totalSleepHours')
-        corr_labels['totalSleepHours'] = 'Sono Total'
-    if 'deepSleepHours' in merged.columns:
-        corr_cols.append('deepSleepHours')
-        corr_labels['deepSleepHours'] = 'Sono Profundo'
-    if 'chargedValue' in merged.columns:
-        corr_cols.append('chargedValue')
-        corr_labels['chargedValue'] = 'BB Recarga'
-    if 'drainedValue' in merged.columns:
-        corr_cols.append('drainedValue')
-        corr_labels['drainedValue'] = 'BB Descarga'
-    if 'averageStressLevel' in merged.columns:
-        corr_cols.append('averageStressLevel')
-        corr_labels['averageStressLevel'] = 'Estresse'
-    if 'HRV_value' in merged.columns:
-        corr_cols.append('HRV_value')
-        corr_labels['HRV_value'] = 'HRV'
-    if 'HR_value' in merged.columns:
-        corr_cols.append('HR_value')
-        corr_labels['HR_value'] = 'FC Repouso'
-    
-    corr_data = merged[corr_cols].dropna()
-    
-    if len(corr_data) >= 3 and len(corr_cols) >= 3:
-        try:
-            corr_matrix = corr_data.corr()
-            
-            # Renomear índices e colunas para labels mais legíveis
-            corr_matrix_display = corr_matrix.rename(index=corr_labels, columns=corr_labels)
-            
-            fig = px.imshow(
-                corr_matrix_display,
-                title="Correlação entre Todas as Métricas",
-                color_continuous_scale='RdBu_r',
-                aspect='auto',
-                labels=dict(color="Correlação"),
-                zmin=-1,
-                zmax=1,
-                text_auto='.2f'
-            )
-            fig.update_layout(height=600)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # === 7. INSIGHTS AUTOMÁTICOS ===
-            st.markdown("---")
-            st.subheader("💡 Insights Principais")
-            
-            # Explicação sobre correlação
-            with st.expander("ℹ️ Como interpretar as correlações?"):
-                st.markdown("""
-                **O que é correlação?**
-                
-                A correlação mede a **relação** entre duas variáveis em uma escala de **-1 a +1**:
-                
-                - **+1.00 a +0.70**: Correlação positiva muito forte (quando uma sobe, a outra também sobe)
-                - **+0.69 a +0.40**: Correlação positiva moderada
-                - **+0.39 a +0.20**: Correlação positiva fraca
-                - **+0.19 a -0.19**: Sem correlação significativa
-                - **-0.20 a -0.39**: Correlação negativa fraca
-                - **-0.40 a -0.69**: Correlação negativa moderada (quando uma sobe, a outra desce)
-                - **-0.70 a -1.00**: Correlação negativa muito forte
-                
-                **Exemplos práticos:**
-                - ✅ Correlação positiva: "Mais sono → Mais energia (Body Battery)"
-                - ❌ Correlação negativa: "Mais estresse → Menos sono"
-                - ℹ️ Sem correlação: As variáveis não se influenciam diretamente
-                
-                ⚠️ **Importante**: Correlação não significa causa! Apenas indica que as variáveis tendem a mudar juntas.
-                """)
-            
-            st.markdown("")
-            
-            # Encontrar correlações mais fortes
-            corr_pairs = []
-            for i in range(len(corr_matrix.columns)):
-                for j in range(i+1, len(corr_matrix.columns)):
-                    corr_pairs.append({
-                        'var1': corr_labels.get(corr_matrix.columns[i], corr_matrix.columns[i]),
-                        'var2': corr_labels.get(corr_matrix.columns[j], corr_matrix.columns[j]),
-                        'corr': corr_matrix.iloc[i, j]
-                    })
-            
-            corr_pairs_df = pd.DataFrame(corr_pairs)
-            corr_pairs_df['abs_corr'] = corr_pairs_df['corr'].abs()
-            corr_pairs_df = corr_pairs_df.sort_values('abs_corr', ascending=False)
-            
-            # Mostrar top 5 correlações
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**🔝 Principais Relações Encontradas:**")
-                st.markdown("*As 5 correlações mais fortes nos seus dados*")
-                st.markdown("")
-                
-                for idx, row in corr_pairs_df.head(5).iterrows():
-                    corr_val = row['corr']
-                    
-                    # Determinar força e direção
-                    if abs(corr_val) >= 0.7:
-                        strength = "muito forte"
-                        emoji = "🔥"
-                    elif abs(corr_val) >= 0.4:
-                        strength = "moderada"
-                        emoji = "💪"
-                    elif abs(corr_val) >= 0.2:
-                        strength = "fraca"
-                        emoji = "👍"
-                    else:
-                        strength = "muito fraca"
-                        emoji = "ℹ️"
-                    
-                    direction = "positiva" if corr_val > 0 else "negativa"
-                    
-                    # Explicação da relação
-                    if corr_val > 0:
-                        explanation = "Quando uma aumenta, a outra tende a aumentar"
-                        color = "success"
-                    else:
-                        explanation = "Quando uma aumenta, a outra tende a diminuir"
-                        color = "error"
-                    
-                    if abs(corr_val) >= 0.2:
-                        if color == "success":
-                            st.success(f"{emoji} **{row['var1']} ↔️ {row['var2']}**  \n"
-                                     f"Correlação: **{corr_val:.2f}** ({strength} {direction})  \n"
-                                     f"_{explanation}_")
-                        else:
-                            st.error(f"{emoji} **{row['var1']} ↔️ {row['var2']}**  \n"
-                                   f"Correlação: **{corr_val:.2f}** ({strength} {direction})  \n"
-                                   f"_{explanation}_")
-                    else:
-                        st.info(f"{emoji} **{row['var1']} ↔️ {row['var2']}**  \n"
-                               f"Correlação: **{corr_val:.2f}** ({strength})  \n"
-                               f"_Pouca ou nenhuma relação detectada_")
-            
-            with col2:
-                st.markdown("**🎯 Recomendações Personalizadas:**")
-                st.markdown("*Baseadas nos padrões encontrados*")
-                st.markdown("")
-                
-                # Recomendações baseadas em correlações
-                recommendations = []
-                
-                # Sono e Body Battery
-                if 'totalSleepHours' in corr_matrix.columns and 'chargedValue' in corr_matrix.columns:
-                    corr_val = corr_matrix.loc['totalSleepHours', 'chargedValue']
-                    if corr_val > 0.4:
-                        recommendations.append({
-                            'emoji': '💤',
-                            'title': 'Sono é sua melhor recarga!',
-                            'text': f'Seus dados mostram forte relação ({corr_val:.2f}) entre horas de sono e energia. Priorize dormir bem para ter mais Body Battery.'
-                        })
-                    elif corr_val > 0.2:
-                        recommendations.append({
-                            'emoji': '💤',
-                            'title': 'Sono ajuda na energia',
-                            'text': f'Há uma relação moderada ({corr_val:.2f}) entre sono e energia. Tente dormir mais consistentemente.'
-                        })
-                
-                # Atividade e Sono Profundo
-                if 'calories' in corr_matrix.columns and 'deepSleepHours' in corr_matrix.columns:
-                    corr_val = corr_matrix.loc['calories', 'deepSleepHours']
-                    if corr_val > 0.4:
-                        recommendations.append({
-                            'emoji': '🏃',
-                            'title': 'Exercício melhora seu sono!',
-                            'text': f'Correlação forte ({corr_val:.2f}) entre atividade e sono profundo. Treinar ajuda você a dormir melhor!'
-                        })
-                    elif corr_val > 0.2:
-                        recommendations.append({
-                            'emoji': '🏃',
-                            'title': 'Mantenha-se ativo',
-                            'text': f'Atividade física tem relação positiva ({corr_val:.2f}) com sono profundo. Continue treinando!'
-                        })
-                
-                # Estresse e Sono
-                if 'averageStressLevel' in corr_matrix.columns and 'totalSleepHours' in corr_matrix.columns:
-                    corr_val = corr_matrix.loc['averageStressLevel', 'totalSleepHours']
-                    if corr_val < -0.4:
-                        recommendations.append({
-                            'emoji': '😰',
-                            'title': 'Estresse prejudica seu sono',
-                            'text': f'Correlação negativa forte ({corr_val:.2f}): mais estresse = menos sono. Pratique técnicas de relaxamento!'
-                        })
-                    elif corr_val < -0.2:
-                        recommendations.append({
-                            'emoji': '😰',
-                            'title': 'Gerencie o estresse',
-                            'text': f'Estresse tem relação negativa ({corr_val:.2f}) com sono. Considere meditação ou respiração.'
-                        })
-                
-                # HRV e Sono
-                if 'HRV_value' in corr_matrix.columns and 'totalSleepHours' in corr_matrix.columns:
-                    corr_val = corr_matrix.loc['HRV_value', 'totalSleepHours']
-                    if corr_val > 0.4:
-                        recommendations.append({
-                            'emoji': '❤️',
-                            'title': 'Sono = melhor recuperação',
-                            'text': f'HRV alto com mais sono ({corr_val:.2f}). Seu corpo se recupera melhor quando você descansa!'
-                        })
-                    elif corr_val > 0.2:
-                        recommendations.append({
-                            'emoji': '❤️',
-                            'title': 'Descanse para recuperar',
-                            'text': f'HRV melhora com sono ({corr_val:.2f}). Priorize o descanso para otimizar recuperação.'
-                        })
-                
-                # Body Battery e Atividade
-                if 'drainedValue' in corr_matrix.columns and 'calories' in corr_matrix.columns:
-                    corr_val = corr_matrix.loc['drainedValue', 'calories']
-                    if corr_val > 0.4:
-                        recommendations.append({
-                            'emoji': '🔋',
-                            'title': 'Balance treino e descanso',
-                            'text': f'Atividade intensa gasta muita energia ({corr_val:.2f}). Certifique-se de recuperar adequadamente!'
-                        })
-                
-                if not recommendations:
-                    recommendations.append({
-                        'emoji': '📊',
-                        'title': 'Continue monitorando',
-                        'text': 'Ainda não há correlações fortes suficientes. Com mais dados, padrões mais claros surgirão!'
-                    })
-                
-                for rec in recommendations:
-                    st.markdown(f"**{rec['emoji']} {rec['title']}**")
-                    st.markdown(f"_{rec['text']}_")
-                    st.markdown("")
-                    
-        except Exception as e:
-            st.error(f"Erro ao calcular correlação: {str(e)}")
-    else:
-        st.warning("Dados insuficientes para matriz de correlação completa")
-
-
-def create_summary_dashboard(activities_df, sleep_df, health_df, body_battery_df=None, stress_df=None):
-    """Cria dashboard resumido com todas as métricas principais"""
-    st.header("🎯 Dashboard Resumido")
-    
-    # Período de análise
-    if activities_df is not None and len(activities_df) > 0:
-        min_date = activities_df['startTimeLocal'].min()
-        max_date = activities_df['startTimeLocal'].max()
-        
-        # Verificar se as datas são válidas (não são NaT)
-        if pd.notna(min_date) and pd.notna(max_date):
-            st.info(f"📅 Período analisado: {min_date.strftime('%d/%m/%Y')} até {max_date.strftime('%d/%m/%Y')}")
-        else:
-            st.warning("⚠️ Datas das atividades não puderam ser processadas corretamente")
-    
-    # Cards de métricas principais
-    st.markdown("### 📈 Visão Geral")
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        if activities_df is not None and len(activities_df) > 0:
-            total_act = len(activities_df)
-            st.metric("🏃 Atividades", f"{total_act}")
-        else:
-            st.metric("🏃 Atividades", "0")
-    
-    with col2:
-        if sleep_df is not None and len(sleep_df) > 0:
-            avg_sleep = sleep_df['totalSleepHours'].mean()
-            st.metric("😴 Sono Médio", f"{avg_sleep:.1f}h")
-        else:
-            st.metric("😴 Sono Médio", "N/A")
-    
-    with col3:
-        if body_battery_df is not None and len(body_battery_df) > 0 and 'highest_value' in body_battery_df.columns:
-            avg_bb = body_battery_df['highest_value'].mean()
-            st.metric("🔋 Body Battery", f"{avg_bb:.0f}")
-        else:
-            st.metric("🔋 Body Battery", "N/A")
-    
-    with col4:
-        if stress_df is not None and len(stress_df) > 0:
-            stress_total = stress_df[stress_df['type'] == 'TOTAL']
-            if len(stress_total) > 0:
-                avg_stress = stress_total['averageStressLevel'].mean()
-                st.metric("😰 Estresse", f"{avg_stress:.0f}")
-            else:
-                st.metric("😰 Estresse", "N/A")
-        else:
-            st.metric("😰 Estresse", "N/A")
-    
-    with col5:
-        if health_df is not None and len(health_df) > 0 and 'HRV_value' in health_df.columns:
-            avg_hrv = health_df['HRV_value'].dropna().mean()
-            if not pd.isna(avg_hrv):
-                st.metric("❤️ HRV", f"{avg_hrv:.0f} ms")
-            else:
-                st.metric("❤️ HRV", "N/A")
-        else:
-            st.metric("❤️ HRV", "N/A")
-    
-    st.markdown("---")
-    
-    # Atividades
-    if activities_df is not None:
-        st.subheader("🏃 Resumo de Atividades")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            total_act = len(activities_df)
-            st.metric("Total de Atividades", f"{total_act}")
-        
-        with col2:
-            total_dist = activities_df['distance_km'].sum()
-            st.metric("Distância Total", f"{total_dist:.0f} km")
-        
-        with col3:
-            if 'activeCalories' in activities_df.columns:
-                active_cal = activities_df['activeCalories'].sum()
-                st.metric("Calorias", f"{active_cal:_.0f}".replace('_', '.'))
-            else:
-                total_cal = activities_df['calories'].sum()
-                st.metric("Calorias", f"{total_cal:_.0f}".replace('_', '.'))
-        
-        with col4:
-            avg_duration = activities_df['duration_minutes'].mean()
-            st.metric("Duração Média", f"{avg_duration:.0f} min")
-        
-        # Gráfico de tendência
-        monthly_activities = activities_df.groupby('month').agg({
-            'activityId': 'count',
-            'distance_km': 'sum'
-        }).reset_index()
-        monthly_activities['month'] = monthly_activities['month'].astype(str)
-        
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        
-        fig.add_trace(
-            go.Bar(x=monthly_activities['month'], y=monthly_activities['activityId'], 
-                   name="Quantidade", marker_color='lightblue'),
-            secondary_y=False,
-        )
-        
-        fig.add_trace(
-            go.Scatter(x=monthly_activities['month'], y=monthly_activities['distance_km'],
-                      name="Distância (km)", mode='lines+markers', line=dict(color='red', width=3)),
-            secondary_y=True,
-        )
-        
-        fig.update_xaxes(title_text="Mês")
-        fig.update_yaxes(title_text="Quantidade de Atividades", secondary_y=False)
-        fig.update_yaxes(title_text="Distância (km)", secondary_y=True)
-        fig.update_layout(title_text="Evolução Mensal das Atividades")
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown("---")
-    
-    # Sono
-    if sleep_df is not None:
-        st.subheader("😴 Resumo de Sono")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            avg_sleep = sleep_df['totalSleepHours'].mean()
-            st.metric("Sono Médio", f"{avg_sleep:.1f}h")
-        
-        with col2:
-            avg_deep = sleep_df['deepSleepHours'].mean()
-            st.metric("Sono Profundo", f"{avg_deep:.1f}h")
-        
-        with col3:
-            avg_rem = sleep_df['remSleepHours'].mean()
-            st.metric("Sono REM", f"{avg_rem:.1f}h")
-        
-        with col4:
-            if 'overallScore' in sleep_df.columns:
-                avg_score = sleep_df['overallScore'].mean()
-                st.metric("Score Médio", f"{avg_score:.0f}")
-        
-        # Gráfico de tendência mensal
-        monthly_sleep = sleep_df.groupby('month').agg({
-            'totalSleepHours': 'mean',
-            'deepSleepHours': 'mean',
-            'remSleepHours': 'mean'
-        }).reset_index()
-        monthly_sleep['month'] = monthly_sleep['month'].astype(str)
-        
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=monthly_sleep['month'], y=monthly_sleep['totalSleepHours'],
-                                mode='lines+markers', name='Total', line=dict(color='#4B0082', width=3)))
-        fig.add_trace(go.Scatter(x=monthly_sleep['month'], y=monthly_sleep['deepSleepHours'],
-                                mode='lines+markers', name='Profundo', line=dict(color='#1E3A8A')))
-        fig.add_trace(go.Scatter(x=monthly_sleep['month'], y=monthly_sleep['remSleepHours'],
-                                mode='lines+markers', name='REM', line=dict(color='#A78BFA')))
-        
-        fig.update_layout(
-            title="Evolução Mensal do Sono",
-            xaxis_title="Mês",
-            yaxis_title="Horas",
-            hovermode='x unified'
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown("---")
-    
-    # Body Battery e Estresse
-    col_bb, col_stress = st.columns(2)
-    
-    with col_bb:
-        if body_battery_df is not None and len(body_battery_df) > 0:
-            st.subheader("🔋 Body Battery")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if 'highest_value' in body_battery_df.columns:
-                    avg_high = body_battery_df['highest_value'].mean()
-                    st.metric("Máximo Médio", f"{avg_high:.0f}")
-            
-            with col2:
-                if 'chargedValue' in body_battery_df.columns:
-                    avg_charge = body_battery_df['chargedValue'].mean()
-                    st.metric("Recarga Média", f"+{avg_charge:.0f}")
-            
-            # Mini gráfico
-            if 'highest_value' in body_battery_df.columns and 'lowest_value' in body_battery_df.columns:
-                bb_recent = body_battery_df.tail(14).sort_values('calendarDate')
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=bb_recent['calendarDate'],
-                    y=bb_recent['highest_value'],
-                    mode='lines+markers',
-                    name='Máximo',
-                    line=dict(color='#10B981', width=2),
-                    marker=dict(size=6)
-                ))
-                fig.add_trace(go.Scatter(
-                    x=bb_recent['calendarDate'],
-                    y=bb_recent['lowest_value'],
-                    mode='lines+markers',
-                    name='Mínimo',
-                    line=dict(color='#EF4444', width=2),
-                    marker=dict(size=6)
-                ))
-                fig.update_layout(
-                    title="Últimos 14 dias",
-                    xaxis_title="",
-                    yaxis_title="Body Battery",
-                    height=250,
-                    margin=dict(l=10, r=10, t=40, b=10)
-                )
-                st.plotly_chart(fig, use_container_width=True)
-    
-    with col_stress:
-        if stress_df is not None and len(stress_df) > 0:
-            st.subheader("😰 Estresse")
-            
-            stress_total = stress_df[stress_df['type'] == 'TOTAL']
-            
-            if len(stress_total) > 0:
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    avg_stress = stress_total['averageStressLevel'].mean()
-                    st.metric("Nível Médio", f"{avg_stress:.0f}")
-                
-                with col2:
-                    rest_time = stress_total['restDuration'].mean()
-                    st.metric("Descanso/dia", f"{rest_time:.0f} min")
-                
-                # Mini gráfico
-                stress_recent = stress_total.tail(14).sort_values('calendarDate')
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=stress_recent['calendarDate'],
-                    y=stress_recent['averageStressLevel'],
-                    mode='lines+markers',
-                    name='Estresse',
-                    line=dict(color='#F97316', width=2),
-                    marker=dict(size=6),
-                    fill='tozeroy',
-                    fillcolor='rgba(249, 115, 22, 0.1)'
-                ))
-                fig.add_hline(y=50, line_dash="dash", line_color="orange", line_width=1)
-                fig.update_layout(
-                    title="Últimos 14 dias",
-                    xaxis_title="",
-                    yaxis_title="Nível",
-                    height=250,
-                    margin=dict(l=10, r=10, t=40, b=10)
-                )
-                st.plotly_chart(fig, use_container_width=True)
-    
-    # Estatísticas gerais
-    st.markdown("---")
-    st.subheader("📊 Estatísticas Gerais")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if activities_df is not None:
-            st.write("**Top 5 Atividades por Distância**")
-            top_activities = activities_df.nlargest(5, 'distance_km')[['startTimeLocal', 'activityType', 'distance_km', 'duration_minutes']]
-            top_activities['startTimeLocal'] = top_activities['startTimeLocal'].dt.strftime('%d/%m/%Y')
-            top_activities.columns = ['Data', 'Tipo', 'Distância (km)', 'Duração (min)']
-            st.dataframe(top_activities, hide_index=True, use_container_width=True)
-    
-    with col2:
-        if sleep_df is not None:
-            st.write("**Melhores Noites de Sono**")
-            
-            # Verificar se tem score disponível
-            if 'overallScore' in sleep_df.columns and sleep_df['overallScore'].notna().any():
-                # Ordenar por score
-                top_sleep = sleep_df.dropna(subset=['overallScore']).nlargest(5, 'overallScore')[
-                    ['calendarDate', 'overallScore', 'totalSleepHours', 'deepSleepHours']
-                ]
-                top_sleep['calendarDate'] = top_sleep['calendarDate'].dt.strftime('%d/%m/%Y')
-                top_sleep.columns = ['Data', 'Score', 'Total (h)', 'Profundo (h)']
-            else:
-                # Fallback: ordenar por horas totais
-                top_sleep = sleep_df.nlargest(5, 'totalSleepHours')[['calendarDate', 'totalSleepHours', 'deepSleepHours']]
-                top_sleep['calendarDate'] = top_sleep['calendarDate'].dt.strftime('%d/%m/%Y')
-                top_sleep.columns = ['Data', 'Total (h)', 'Profundo (h)']
-            
-            st.dataframe(top_sleep, hide_index=True, use_container_width=True)
-
-
-def main():
-    """Função principal do dashboard"""
-    
-    # Header
-    st.markdown('<h1 class="main-header">⚡ Garmin Connect Analytics</h1>', unsafe_allow_html=True)
-    st.markdown("### Dashboard Completo de Análise de Atividades, Sono e Saúde")
-    
-    # Sidebar
+def carregar_dados() -> GarminExport | None:
     with st.sidebar:
-        st.image("https://www.garmin.com/assets/images/garmin-icon.png", width=100)
-        st.title("📁 Upload de Dados")
-        st.markdown("---")
-        
-        uploaded_file = st.file_uploader(
-            "Faça upload do arquivo ZIP do Garmin Connect",
-            type=['zip'],
-            help="Exporte seus dados do Garmin Connect e faça upload do arquivo ZIP"
-        )
-        
-        st.markdown("---")
-        st.markdown("### ℹ️ Sobre")
-        st.info(
-            """
-            Este dashboard analisa seus dados exportados do Garmin Connect, incluindo:
-            
-            - 🏃 Atividades físicas
-            - 😴 Dados de sono
-            - 💗 Métricas de saúde
-            - 💧 Hidratação
-            - 🔗 Correlações
-            
-            **📥 Como exportar seus dados do Garmin:**
-            
-            1. Acesse: https://www.garmin.com/en-US/account/datamanagement/
-            2. Login → Export Your Data → Request Data Export
-            3. Aguarde o email (pode demorar minutos ou horas)
-            4. Baixe o arquivo ZIP do link no email
-            
-            **📱 Como usar o dashboard:**
-            
-            1. Faça upload do arquivo ZIP
-            2. Explore as 7 abas de análise!
-            """
-        )
-        
-        st.markdown("---")
-        st.markdown("Desenvolvido com ❤️ usando Streamlit")
-    
-    # Processar dados quando arquivo é carregado
-    if uploaded_file is not None:
-        with st.spinner("🔄 Processando seus dados... Isso pode levar alguns instantes."):
-            # Criar analisador
-            analyzer = GarminDataAnalyzer(uploaded_file)
-            analyzer.load_all_data()
-        
-        st.success("✅ Dados carregados com sucesso!")
-        
-        # Menu de navegação
-        st.markdown("---")
-        
-        tabs = st.tabs([
-            "📊 Resumo",
-            "🏃 Atividades - Visão Geral",
-            "📈 Atividades - Análise Completa",
-            "😴 Sono",
-            "💗 Saúde",
-            "🔗 Correlações"
-        ])
-        
-        with tabs[0]:
-            create_summary_dashboard(analyzer.activities_df, analyzer.sleep_df, analyzer.health_df, analyzer.body_battery_df, analyzer.stress_df)
-        
-        with tabs[1]:
-            if analyzer.activities_df is not None:
-                create_activities_overview(analyzer.activities_df)
-            else:
-                st.warning("Dados de atividades não disponíveis")
-        
-        with tabs[2]:
-            if analyzer.activities_df is not None:
-                # Combinar análise temporal e detalhada
-                create_activities_temporal_analysis(analyzer.activities_df)
-                st.markdown("---")
-                st.markdown("---")
-                create_activities_detailed_analysis(analyzer.activities_df)
-            else:
-                st.warning("Dados de atividades não disponíveis")
-        
-        with tabs[3]:
-            create_sleep_analysis(analyzer.sleep_df)
-        
-        with tabs[4]:
-            create_health_analysis(analyzer.health_df, analyzer.body_battery_df, analyzer.stress_df)
-        
-        with tabs[5]:
-            create_correlation_analysis(analyzer.activities_df, analyzer.sleep_df, analyzer.body_battery_df, analyzer.stress_df, analyzer.health_df)
-        
-    else:
-        # Tela inicial
-        st.markdown("---")
-        col1, col2, col3 = st.columns([1, 2, 1])
-        
-        with col2:
-            st.image("https://www.garmin.com/assets/images/garmin-icon.png", width=200)
-            st.markdown(
-                """
-                <div style='text-align: center; padding: 20px;'>
-                    <h2>Bem-vindo ao Dashboard Garmin Analytics!</h2>
-                    <p style='font-size: 18px;'>
-                        Para começar, faça upload do seu arquivo ZIP do Garmin Connect 
-                        usando o menu lateral à esquerda.
-                    </p>
-                    <br>
-                    <p style='font-size: 14px; color: #666;'>
-                        💡 <b>Dica:</b> Acesse garmin.com/account/datamanagement 
-                        para exportar seus dados.
-                    </p>
-                </div>
-                """,
-                unsafe_allow_html=True
+        uploaded = st.file_uploader("📤 Upload do ZIP do Garmin Connect", type=["zip"])
+        caminho = None
+        if uploaded is None:
+            caminho = st.text_input(
+                "…ou caminho da pasta extraída",
+                value=r"C:\Users\paulo\Downloads\d1332fc4-ec15-4bce-b1ce-e6c979982b81_1",
+                help="Caminho local da pasta com os dados (alternativa ao upload do ZIP).",
             )
-        
-        st.markdown("---")
-        
-        # Informações sobre o que será analisado
-        st.subheader("🎯 O que você vai descobrir:")
-        
-        col1, col2, col3 = st.columns(3)
-        
+        try:
+            if uploaded is not None:
+                with st.spinner("🔄 Processando export…"):
+                    return _load_zip_bytes(uploaded.getvalue())
+            if caminho and Path(caminho).is_dir():
+                with st.spinner("🔄 Processando export…"):
+                    mt = max(f.stat().st_mtime for f in Path(caminho).rglob("*") if f.is_file())
+                    return _load_folder(caminho, mt)
+            if caminho:
+                st.warning("Pasta não encontrada.")
+        except Exception as e:
+            st.error(f"Erro ao carregar dados: {e}")
+    return None
+
+
+g = carregar_dados()
+if g is None:
+    st.markdown("<h1 class='main-header'>⚡ Garmin Connect Analytics</h1>", unsafe_allow_html=True)
+    st.markdown(
+        "<p class='sub-header'>Análise completa de atividades, sono, saúde e recuperação</p>",
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "Carregue o export dos seus dados do Garmin Connect para começar.\n\n"
+        "1. Acesse garmin.com/pt-BR/account/datamanagement/ → **Exportar seus dados**\n"
+        "2. Baixe o ZIP recebido por e-mail e faça o upload aqui (ou informe a pasta extraída)."
+    )
+    st.stop()
+
+for w in g.warnings:
+    st.warning(w)
+
+# --------------------------------------------------------- contexto global
+TODAS_DATAS = pd.to_datetime(
+    (g.master.index if g.master is not None and len(g.master) else pd.Series(dtype="datetime64[ns]"))
+)
+DATA_MIN = TODAS_DATAS.min() if len(TODAS_DATAS) else pd.Timestamp("2025-01-01")
+DATA_MAX = TODAS_DATAS.max() if len(TODAS_DATAS) else pd.Timestamp.today()
+
+with st.sidebar:
+    st.markdown("### 📅 Período")
+    periodo = st.date_input(
+        "Filtro global",
+        value=(DATA_MIN.date(), DATA_MAX.date()),
+        min_value=DATA_MIN.date(),
+        max_value=DATA_MAX.date(),
+        help="Aplica a todas as abas.",
+    )
+    if len(periodo) == 2:
+        P_INI, P_FIM = pd.Timestamp(periodo[0]), pd.Timestamp(periodo[1])
+    else:
+        P_INI, P_FIM = DATA_MIN, DATA_MAX
+
+    if g.profile:
+        p = g.profile
+        st.markdown("### 👤 Perfil")
+        altura = f"{p['altura_m']:.2f} m" if p.get("altura_m") else "—"
+        peso = f"{p['peso_kg']:.1f} kg" if p.get("peso_kg") else "—"
+        st.markdown(
+            f"**{p.get('nome', '—')}**"
+            + (f" · {p['idade']} anos" if p.get("idade") else "")
+            + f"\n\n{altura} · {peso}"
+            + (f" · IMC {p['bmi']:.1f}" if p.get("bmi") else "")
+        )
+    st.markdown("---")
+    st.caption("Desenvolvido com Streamlit + Plotly")
+
+
+def no_periodo(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not len(df) or "date" not in df.columns:
+        return df
+    return df[(df["date"] >= P_INI) & (df["date"] <= P_FIM)].copy()
+
+
+# ============================================================= insights auto
+def gerar_insights(g: GarminExport) -> list[dict]:
+    """Motor de insights: varre os dados e devolve achados acionáveis."""
+    out = []
+    m = g.master
+
+    if m is not None and len(m):
+        ult = m.iloc[-30:]
+        ant = m.iloc[-60:-30]
+
+        def _cmp(col, rotulo, fmt="{:+.1f}", menor_e_melhor=False, limiar=3.0):
+            if col in ult.columns and col in ant.columns:
+                a, b = ult[col].mean(), ant[col].mean()
+                if pd.notna(a) and pd.notna(b) and b != 0:
+                    d = (a - b) / abs(b) * 100
+                    if abs(d) >= limiar:
+                        bom = (d < 0) if menor_e_melhor else (d > 0)
+                        out.append({
+                            "emoji": "📈" if bom else "📉",
+                            "titulo": f"{rotulo}: {d:+.0f}% nos últimos 30 dias",
+                            "texto": f"Média de {b:.1f} → {a:.1f} comparando os dois últimos meses.",
+                            "bom": bom,
+                        })
+
+        _cmp("sono_h", "Horas de sono", menor_e_melhor=False)
+        _cmp("fc_repouso", "FC de repouso", menor_e_melhor=True)
+        _cmp("estresse_medio", "Estresse médio", menor_e_melhor=True)
+        _cmp("passos", "Passos diários")
+
+        if "acwr" in m.columns:
+            acwr = m["acwr"].iloc[-1]
+            if pd.notna(acwr):
+                if acwr > 1.3:
+                    out.append({
+                        "emoji": "⚠️", "bom": False, "titulo": f"Carga de treino alta (ACWR {acwr:.2f})",
+                        "texto": "Aumento de volume muito rápido vs média de 4 semanas — risco de lesão. Considere uma semana de carga menor.",
+                    })
+                elif acwr < 0.8:
+                    out.append({
+                        "emoji": "🛋️", "bom": None, "titulo": f"Carga de treino baixa (ACWR {acwr:.2f})",
+                        "texto": "Volume bem abaixo da média das últimas 4 semanas — destreino ou descanso planejado.",
+                    })
+                else:
+                    out.append({
+                        "emoji": "✅", "bom": True, "titulo": f"Carga de treino equilibrada (ACWR {acwr:.2f})",
+                        "texto": "Progressão de volume dentro da faixa ideal (0,8–1,3).",
+                    })
+
+        # dia seguinte: treino pesado → sono/estresse?
+        for alvo, rot in [("estresse_medio", "estresse"), ("sono_h", "sono"), ("bb_min", "energia mínima")]:
+            par = m[[f"treino_min_ontem", alvo]].dropna()
+            if len(par) >= 20:
+                r = par["treino_min_ontem"].corr(par[alvo])
+                if pd.notna(r) and abs(r) >= 0.25:
+                    dir_txt = "aumenta" if r > 0 else "diminui"
+                    out.append({
+                        "emoji": "🔬", "bom": None,
+                        "titulo": f"Treinar mais → {rot} do dia seguinte {dir_txt} (r={r:.2f})",
+                        "texto": "Relação defasada de 1 dia nos seus dados.",
+                    })
+
+    if g.sleep is not None and len(g.sleep):
+        s = no_periodo(g.sleep)
+        divida = s["divida_sono_h"].mean()
+        if pd.notna(divida) and divida > 0.5:
+            out.append({
+                "emoji": "😴", "bom": False,
+                "titulo": f"Dívida média de sono: {divida:.1f} h/noite (alvo 7h30)",
+                "texto": f"Equivale a {divida * 7:.0f} h de sono perdidas por semana.",
+            })
+        consist = s["hora_dormir"].std()
+        if pd.notna(consist) and consist > 1.2:
+            out.append({
+                "emoji": "🌗", "bom": False,
+                "titulo": f"Horário de dormir irregular (±{consist:.1f} h)",
+                "texto": "Regularidade de horário é um dos maiores preditores de qualidade do sono.",
+            })
+
+    if g.daily is not None and len(g.daily):
+        d = no_periodo(g.daily)
+        if len(d) and "atingiu_meta_passos" in d.columns:
+            taxa = d["atingiu_meta_passos"].mean() * 100
+            out.append({
+                "emoji": "👟", "bom": taxa >= 60,
+                "titulo": f"Meta de passos atingida em {taxa:.0f}% dos dias",
+                "texto": f"Média de {d['passos'].mean():,.0f} passos/dia.".replace(",", "."),
+            })
+
+    return out
+
+
+# ==================================================================== views
+def view_resumo():
+    st.header("🎯 Resumo Geral")
+    a = no_periodo(g.activities)
+    s = no_periodo(g.sleep)
+    d = no_periodo(g.daily)
+
+    # --- KPIs principais
+    ult30 = max(P_FIM - pd.Timedelta(days=30), P_INI)
+    kcal_atv = d["kcal_ativa"].mean() if d is not None and len(d) else None
+
+    itens = [
+        ("🏃 Atividades", f"{len(a):,}".replace(",", ".") if a is not None else "0", None),
+        ("⏱️ Tempo de treino", fmt_min(a["duracao_min"].sum()) if a is not None and len(a) else "—",
+         f"{a['duracao_min'].mean():.0f} min médios" if a is not None and len(a) else None),
+        ("📏 Distância", f"{a['dist_km'].sum():,.0f} km".replace(",", ".") if a is not None and len(a) else "—", None),
+        ("😴 Sono médio", f"{s['sono_h'].mean():.1f} h" if s is not None and len(s) else "—",
+         f"score {s['score_overall'].mean():.0f}" if s is not None and s["score_overall"].notna().any() else None),
+        ("❤️ FC repouso", f"{d['fc_repouso'].mean():.0f} bpm" if d is not None and d["fc_repouso"].notna().any() else "—", None),
+        ("😰 Estresse", f"{d['estresse_medio'].mean():.0f}" if d is not None and d["estresse_medio"].notna().any() else "—", None),
+        ("👟 Passos/dia", f"{d['passos'].mean():,.0f}".replace(",", ".") if d is not None and d["passos"].notna().any() else "—", None),
+        ("🔥 kcal ativas/dia", f"{kcal_atv:.0f}" if kcal_atv is not None and pd.notna(kcal_atv) else "—", None),
+    ]
+    kpi([1] * 8, itens)
+    st.markdown("---")
+
+    # --- evolução mensal (volume + distância)
+    if a is not None and len(a):
+        st.subheader("Evolução mensal")
+        mensal = a.groupby("month").agg(qtd=("activityId", "count"), min=("duracao_min", "sum"),
+                                        km=("dist_km", "sum"), kcal=("kcal", "sum")).reset_index()
+        fig = go.Figure()
+        fig.add_bar(x=mensal["month"], y=mensal["min"], name="Minutos", marker_color=PALETA[1])
+        fig.add_scatter(x=mensal["month"], y=mensal["km"], name="Distância (km)", yaxis="y2",
+                        mode="lines+markers", line=dict(color=PALETA[2], width=3))
+        fig.update_layout(
+            yaxis=dict(title="Minutos"),
+            yaxis2=dict(title="km", overlaying="y", side="right"),
+            legend=dict(orientation="h", y=1.12),
+        )
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # --- últimos 30 dias: energia vs estresse vs sono
+    if d is not None and len(d):
+        st.subheader("Últimos 30 dias — energia, estresse e sono")
+        dd = d[d["date"] >= ult30]
+        ss = s[s["date"] >= ult30][["date", "sono_h"]] if s is not None and len(s) else None
+        fig = go.Figure()
+        fig.add_bar(x=dd["date"], y=dd["bb_max"], name="BB máx", marker_color=C_POS, opacity=0.55)
+        fig.add_bar(x=dd["date"], y=dd["bb_min"], name="BB mín", marker_color=C_NEG, opacity=0.55)
+        fig.add_scatter(x=dd["date"], y=dd["estresse_medio"], name="Estresse", mode="lines",
+                        line=dict(color=PALETA[3], width=2), yaxis="y2")
+        if ss is not None and len(ss):
+            fig.add_scatter(x=ss["date"], y=ss["sono_h"], name="Sono (h)", mode="lines",
+                            line=dict(color=PALETA[0], width=2, dash="dot"), yaxis="y2")
+        fig.update_layout(
+            yaxis=dict(title="Body Battery", range=[0, 100]),
+            yaxis2=dict(title="Estresse / Sono h", overlaying="y", side="right"),
+            barmode="overlay", legend=dict(orientation="h", y=1.12),
+        )
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # --- insights
+    st.subheader("💡 Destaques dos seus dados")
+    ins = gerar_insights(g)
+    ins = ins[:6] if ins else []
+    if ins:
+        cols = st.columns(min(len(ins), 3))
+        for i, item in enumerate(ins):
+            with cols[i % 3]:
+                cor = "#2ecc7133" if item["bom"] else ("#e5737333" if item["bom"] is False else "#90a4ae33")
+                st.markdown(
+                    f"<div class='insight-card' style='border-left:4px solid "
+                    f"{'#2ecc71' if item['bom'] else ('#e57373' if item['bom'] is False else '#90a4ae')}'>"
+                    f"<b>{item['emoji']} {item['titulo']}</b><p>{item['texto']}</p></div>",
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.info("Sem destaques automáticos neste período.")
+
+
+def view_atividades():
+    st.header("🏃 Atividades")
+    a = no_periodo(g.activities)
+    if a is None or not len(a):
+        st.warning("Nenhuma atividade no período.")
+        return
+    linha_resumo_periodo(a, g.activities, "atividades")
+
+    tipos = ["Todos"] + sorted(a["tipo"].unique())
+    tipo = st.selectbox("Tipo de atividade", tipos)
+    af = a[a["tipo"] == tipo] if tipo != "Todos" else a
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("Atividades", f"{len(af):,}".replace(",", "."))
+    with c2:
+        st.metric("Tempo total", fmt_min(af["duracao_min"].sum()))
+    with c3:
+        st.metric("Distância", f"{af['dist_km'].sum():,.0f} km".replace(",", "."))
+    with c4:
+        st.metric("Calorias", f"{af['kcal'].sum():,.0f}".replace(",", "."))
+    with c5:
+        hr = af.loc[af["fc_media"] > 0, "fc_media"]
+        st.metric("FC média", f"{hr.mean():.0f} bpm" if len(hr) else "—")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        cont = af["tipo"].value_counts()
+        fig = px.pie(values=cont.values, names=cont.index, hole=0.45,
+                     color_discrete_sequence=PALETA, title="Distribuição por tipo")
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    with col2:
+        por_dia = af.groupby("weekday").size().reindex(gd.DIAS_SEMANA, fill_value=0)
+        fig = px.bar(x=ordem_dias_pt(), y=por_dia.values, title="Atividades por dia da semana",
+                     labels={"x": "", "y": "Quantidade"}, color_discrete_sequence=[PALETA[1]])
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    st.subheader("🕐 Quando você treina (hora × dia)")
+    hm = af.groupby(["weekday", af["hour"].round(0)]).size().reset_index(name="n")
+    hm["weekday"] = rotulo_dia_curto(hm["weekday"])
+    piv = hm.pivot(index="weekday", columns="hour", values="n")
+    piv = piv.reindex([rotulo_dia_curto(pd.Series([d]))[0] for d in gd.DIAS_SEMANA])
+    fig = px.imshow(piv, aspect="auto", color_continuous_scale=SEQ_VERDE,
+                    labels=dict(x="Hora do dia", y="", color="Atividades"))
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    st.subheader("📊 Comparativo por tipo de atividade")
+    resumo = af.groupby("tipo").agg(
+        qtd=("activityId", "count"),
+        tempo_min=("duracao_min", "sum"),
+        km=("dist_km", "sum"),
+        kcal=("kcal", "sum"),
+        kcal_medio=("kcal", "mean"),
+        fc_media=("fc_media", "mean"),
+    ).sort_values("tempo_min", ascending=False).reset_index()
+    resumo["tempo_medio_min"] = (resumo["tempo_min"] / resumo["qtd"]).round(0)
+    resumo = resumo[["tipo", "qtd", "tempo_min", "tempo_medio_min", "km", "kcal", "kcal_medio", "fc_media"]]
+    resumo.columns = ["Tipo", "Qtd", "Tempo (min)", "Tempo médio", "km", "kcal", "kcal médio", "FC média"]
+    st.dataframe(resumo.round(1), use_container_width=True, hide_index=True)
+
+    st.subheader("🔎 Volume semanal")
+    sem = af.groupby("week").agg(minutos=("duracao_min", "sum"), qtd=("activityId", "count"),
+                                 kcal=("kcal", "sum")).reset_index()
+    fig = go.Figure()
+    fig.add_bar(x=sem["week"], y=sem["minutos"], name="Minutos/semana", marker_color=PALETA[0])
+    fig.add_scatter(x=sem["week"], y=sem["kcal"], name="kcal/semana", yaxis="y2",
+                    mode="lines", line=dict(color=PALETA[3], width=2))
+    fig.update_layout(yaxis=dict(title="Minutos"), yaxis2=dict(title="kcal", overlaying="y", side="right"),
+                      legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    st.subheader("Listagem completa")
+    lst = af.sort_values("start", ascending=False)[
+        ["start", "nome", "tipo", "duracao_min", "dist_km", "kcal", "fc_media", "fc_max", "te_label"]
+    ].copy()
+    lst["start"] = lst["start"].dt.strftime("%d/%m/%Y %H:%M")
+    lst.columns = ["Início", "Nome", "Tipo", "Duração", "km", "kcal", "FC méd", "FC máx", "Efeito"]
+    lst[["Duração", "km", "kcal", "FC méd", "FC máx"]] = lst[["Duração", "km", "kcal", "FC méd", "FC máx"]].round(1)
+    st.dataframe(lst, use_container_width=True, hide_index=True, height=380)
+
+
+def view_performance():
+    st.header("⚡ Performance & Carga de Treino")
+    a = no_periodo(g.activities)
+    if a is None or not len(a):
+        st.warning("Nenhuma atividade no período.")
+        return
+
+    # --- zonas cardíacas
+    st.subheader("❤️ Distribuição de treino por zona cardíaca")
+    zcols = [f"z{i}_min" for i in range(7)]
+    zlabels = ["Abaixo Z1", "Z1 (leve)", "Z2 (aeróbico)", "Z3 (tempo)", "Z4 (limiar)", "Z5 (VO2)", "Acima Z5"]
+    zsum = a[zcols].sum()
+    if zsum.sum() > 0:
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            pct = zsum / zsum.sum() * 100
+            fig = go.Figure(go.Pie(labels=zlabels, values=zsum.values, hole=0.45,
+                                   marker=dict(colors=[C_NEUTRO, "#6ea8fe", "#1abc9c", "#f5a623", "#ef6c6c", "#c0392b", "#8e44ad"])))
+            fig.update_traces(textinfo="percent")
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+        with c2:
+            defs = g.hr_zone_defs
+            if defs is not None:
+                r = defs.iloc[0]
+                st.markdown(
+                    f"**Suas zonas** (método {r.get('trainingMethod','—')}, FC máx {r.get('maxHeartRateUsed','—')} bpm):\n\n"
+                    f"| Zona | FC (bpm) | Tempo no período |\n|---|---|---|\n"
+                    f"| Abaixo Z1 | < {r.get('zone1Floor','—')} | {fmt_min(zsum.iloc[0])} |\n"
+                    f"| Z1 | {r.get('zone1Floor','—')}–{r.get('zone2Floor','—')} | {fmt_min(zsum.iloc[1])} |\n"
+                    f"| Z2 | {r.get('zone2Floor','—')}–{r.get('zone3Floor','—')} | {fmt_min(zsum.iloc[2])} |\n"
+                    f"| Z3 | {r.get('zone3Floor','—')}–{r.get('zone4Floor','—')} | {fmt_min(zsum.iloc[3])} |\n"
+                    f"| Z4 | {r.get('zone4Floor','—')}–{r.get('zone5Floor','—')} | {fmt_min(zsum.iloc[4])} |\n"
+                    f"| Z5 | ≥ {r.get('zone5Floor','—')} | {fmt_min(zsum.iloc[5])} |"
+                )
+            tempo_zona = pd.DataFrame({"Zona": zlabels, "Minutos": zsum.values})
+            fig = px.bar(tempo_zona, x="Zona", y="Minutos", color_discrete_sequence=[PALETA[1]])
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # --- efeito de treino
+    if a["te_label"].notna().any():
+        st.subheader("🧪 Efeito de treino (aeróbico/anaeróbico)")
+        te = a.dropna(subset=["te_label"])
+        cont = te["te_label"].value_counts()
+        c1, c2 = st.columns([2, 3])
+        with c1:
+            fig = px.pie(values=cont.values, names=cont.index, hole=0.45,
+                         color_discrete_sequence=PALETA, title="Tipos de estímulo")
+            fig.update_traces(textinfo="percent")
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+        with c2:
+            fig = px.scatter(te, x="start", y="fc_media", color="te_label", size="duracao_min",
+                             hover_data=["nome", "kcal"], labels={"start": "", "fc_media": "FC média"},
+                             color_discrete_sequence=PALETA)
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # --- corrida
+    corridas = a[a["tipo"].isin(gd.TIPOS_CORRIDA) & (a["dist_km"] > 0)]
+    st.subheader("🏃‍♂️ Corrida")
+    if len(corridas):
+        corridas = corridas.sort_values("start")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Corridas", len(corridas))
+        with c2:
+            st.metric("Volume", f"{corridas['dist_km'].sum():.0f} km")
+        with c3:
+            melhor = corridas.loc[corridas["ritmo_min_km"].idxmin()]
+            st.metric("Melhor ritmo", fmt_ritmo(melhor["ritmo_min_km"]),
+                      f"{melhor['dist_km']:.1f} km em {melhor['start'].strftime('%d/%m/%y')}")
+        with c4:
+            longa = corridas.loc[corridas["dist_km"].idxmax()]
+            st.metric("Mais longa", f"{longa['dist_km']:.1f} km")
+
+        col1, col2 = st.columns(2)
         with col1:
-            st.markdown("""
-            #### 🏃 Atividades
-            - Total de atividades e tipos
-            - Distância percorrida
-            - Calorias queimadas
-            - Análise temporal
-            - Frequência cardíaca
-            - Padrões de treino
-            """)
-        
+            fig = px.scatter(corridas, x="start", y="ritmo_min_km", trendline="lowess",
+                             color=corridas["dist_km"].round(1).astype(str),
+                             labels={"start": "", "ritmo_min_km": "ritmo (min/km)", "color": "km"},
+                             color_discrete_sequence=PALETA,
+                             title="Evolução do ritmo (menor = mais rápido)")
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(style_fig(fig), use_container_width=True)
         with col2:
-            st.markdown("""
-            #### 😴 Sono
-            - Qualidade do sono
-            - Fases do sono (REM, profundo, leve)
-            - Score de sono
-            - Padrões respiratórios
-            - Despertares noturnos
-            - Tendências semanais
-            """)
-        
-        with col3:
-            st.markdown("""
-            #### 💗 Saúde
-            - Métricas de saúde
-            - Correlações
-            - Tendências temporais
-            - Análises avançadas
-            - Insights personalizados
-            """)
+            fig = px.scatter(corridas, x="dist_km", y="fc_media", trendline="ols",
+                             labels={"dist_km": "distância (km)", "fc_media": "FC média"},
+                             color_discrete_sequence=[PALETA[0]],
+                             title="Desgaste: distância × FC média")
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+
+        # dinâmica de corrida
+        din = ["cadencia", "passada_m", "gct_ms", "oscilacao_mm"]
+        din_disp = [c for c in din if corridas[c].notna().sum() >= 3]
+        if din_disp:
+            with st.expander("🔬 Dinâmica de corrida (cadência, contato, oscilação)", expanded=False):
+                cols = st.columns(2)
+                for i, c in enumerate(din_disp):
+                    with cols[i % 2]:
+                        un = {"cadencia": "passos/min", "passada_m": "m", "gct_ms": "ms", "oscilacao_mm": "mm"}[c]
+                        tmp = corridas.dropna(subset=[c])
+                        fig = px.scatter(tmp, x="start", y=c, trendline="lowess",
+                                         labels={"start": "", c: un}, color_discrete_sequence=[PALETA[(i + 1) % len(PALETA)]])
+                        st.plotly_chart(style_fig(fig, height=280), use_container_width=True)
+    else:
+        st.info("Sem corridas com distância registrada no período.")
+
+    # --- força
+    forca = a[(a["tipo"] == "Musculação") & a["series"].notna()]
+    if len(forca):
+        st.subheader("🏋️ Musculação — volume semanal")
+        fs = forca.groupby("week").agg(series=("series", "sum"), reps=("reps", "sum")).reset_index()
+        fig = go.Figure()
+        fig.add_bar(x=fs["week"], y=fs["series"], name="Séries", marker_color=PALETA[4])
+        fig.add_scatter(x=fs["week"], y=fs["reps"], name="Repetições", yaxis="y2", mode="lines",
+                        line=dict(color=PALETA[2], width=2))
+        fig.update_layout(yaxis=dict(title="Séries"), yaxis2=dict(title="Reps", overlaying="y", side="right"),
+                          legend=dict(orientation="h", y=1.12))
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # --- carga e ACWR
+    st.subheader("📐 Carga de treino e ACWR (risco de lesão)")
+    if g.master is not None and "acwr" in g.master.columns:
+        m = g.master[(g.master.index >= P_INI) & (g.master.index <= P_FIM)]
+        fig = go.Figure()
+        fig.add_bar(x=m.index, y=m["carga_7d_min"], name="Carga 7 dias (min)", marker_color=PALETA[1], opacity=0.6)
+        fig.add_scatter(x=m.index, y=m["acwr"], name="ACWR", yaxis="y2", mode="lines",
+                        line=dict(color=PALETA[3], width=2))
+        fig.add_hrect(y0=0.8, y1=1.3, line_width=0, fillcolor=C_POS, opacity=0.15,
+                      yref="y2", annotation_text="zona ideal 0,8–1,3")
+        fig.update_layout(
+            yaxis=dict(title="Minutos (7d)"),
+            yaxis2=dict(title="ACWR", overlaying="y", side="right", range=[0, 2.5]),
+            legend=dict(orientation="h", y=1.12),
+        )
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+        st.caption("ACWR = carga aguda (7 dias) ÷ crônica (média de 4 semanas). "
+                   "Acima de ~1,3 indica aumento abrupto de volume; abaixo de ~0,8, destreino.")
 
 
-if __name__ == "__main__":
-    main()
+def view_sono():
+    st.header("😴 Sono")
+    s = no_periodo(g.sleep)
+    if s is None or not len(s):
+        st.warning("Sem dados de sono no período.")
+        return
+    linha_resumo_periodo(s, g.sleep, "noites")
 
+    media_dormir = media_circular_horario(s["hora_dormir"])
+    media_acordar = media_circular_horario(s["hora_acordar"])
+    kpi([1] * 6, [
+        ("Sono total", f"{s['sono_h'].mean():.1f} h", None),
+        ("Profundo", f"{s['profundo_h'].mean():.1f} h",
+         f"{s['profundo_h'].mean() / s['sono_h'].mean() * 100:.0f}% do total"),
+        ("REM", f"{s['rem_h'].mean():.1f} h",
+         f"{s['rem_h'].mean() / s['sono_h'].mean() * 100:.0f}% do total"),
+        ("Eficiência", f"{s['eficiencia_pct'].mean():.0f}%", None),
+        ("Score médio", f"{s['score_overall'].mean():.0f}" if s["score_overall"].notna().any() else "—", None),
+        ("Horário de dormir", fmt_hora_frac(media_dormir),
+         f"acorda ~{fmt_hora_frac(media_acordar)}"),
+    ])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig = go.Figure()
+        fig.add_scatter(x=s["date"], y=s["sono_h"], mode="markers", name="Sono (h)",
+                        marker=dict(color=PALETA[1], size=6))
+        mm = s.set_index("date")["sono_h"].rolling(7, min_periods=3).mean()
+        fig.add_scatter(x=mm.index, y=mm, mode="lines", name="Média móvel 7d",
+                        line=dict(color=PALETA[0], width=3))
+        fig.add_hline(y=7.5, line_dash="dash", line_color=C_POS, annotation_text="alvo 7h30")
+        fig.update_layout(title="Horas de sono por noite")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    with col2:
+        fig = go.Figure()
+        base = np.zeros(len(s))
+        ordem = [("leve_h", "Leve", "#6ea8fe"), ("profundo_h", "Profundo", "#1e3a8a"),
+                 ("rem_h", "REM", "#b58cda")]
+        for col, nome, cor in ordem:
+            fig.add_bar(x=s["date"], y=s[col], name=nome, base=base, marker_color=cor)
+            base = base + s[col].fillna(0).values
+        fig.update_layout(barmode="stack", title="Composição do sono")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    st.subheader("🌗 Consistência do horário de dormir")
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        fig = px.scatter(x=s["date"], y=s["hora_dormir"] % 24, trendline="lowess",
+                         labels={"x": "", "y": "hora"}, color_discrete_sequence=[PALETA[5]])
+        fig.add_hline(y=media_circular_horario(s["hora_dormir"]) % 24, line_dash="dash", line_color=C_POS)
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+    with c2:
+        por_dia = s.groupby("weekday")["sono_h"].mean().reindex(gd.DIAS_SEMANA)
+        fig = px.bar(x=ordem_dias_pt(), y=por_dia.values, color=por_dia.values,
+                     color_continuous_scale=SEQ_AZUL, labels={"x": "", "y": "h"}, title="Sono médio por dia da semana")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+    st.caption(f"Desvio-padrão do horário de dormir: **±{s['hora_dormir'].std():.1f} h** — "
+               "quanto menor, mais estável o ritmo circadiano.")
+
+    st.subheader("📉 Dívida de sono acumulada (alvo 7h30)")
+    div = s.set_index("date")["divida_sono_h"].cumsum().reset_index()
+    fig = px.area(div, x="date", y="divida_sono_h", color_discrete_sequence=[PALETA[3]])
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # sub-scores e sinais noturnos
+    score_cols = [c for c in ["score_quality", "score_duration", "score_recovery", "score_deep",
+                              "score_rem", "score_restfulness", "score_interruptions"] if c in s.columns]
+    if s[score_cols].notna().any().any():
+        st.subheader("🧩 Onde o seu sono perde pontos")
+        medias = s[score_cols].mean().sort_values()
+        nomes = {"score_quality": "Qualidade", "score_duration": "Duração", "score_recovery": "Recuperação",
+                 "score_deep": "Profundo", "score_rem": "REM", "score_restfulness": "Descanso",
+                 "score_interruptions": "Interrupções"}
+        fig = px.bar(x=[nomes.get(c, c) for c in medias.index], y=medias.values,
+                     color=medias.values, color_continuous_scale=SEQ_VERM, range_color=[40, 100],
+                     labels={"x": "", "y": "score"}, title="Score médio por componente (menor = ponto fraco)")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    sinais = [("spo2_sono", "SpO₂ durante o sono", "%", 90), ("estresse_sono", "Estresse durante o sono", "", 40),
+              ("despertares", "Despertares por noite", "", 5), ("momentos_inquietos", "Momentos inquietos", "", 60)]
+    disp = [(c, t, u, ref) for c, t, u, ref in sinais if c in s.columns and s[c].notna().any()]
+    if disp:
+        st.subheader("🩺 Sinais noturnos")
+        cols = st.columns(len(disp))
+        for col, (c, t, u, ref) in zip(cols, disp):
+            with col:
+                st.metric(t, f"{s[c].mean():.1f}{u}", f"mín {s[c].min():.0f}" if pd.notna(s[c].min()) else None)
+
+
+def view_saude():
+    st.header("💗 Saúde & Energia")
+    d = no_periodo(g.daily)
+    h = no_periodo(g.health)
+
+    # ---------- HRV e FC repouso (diário + status)
+    if h is not None and len(h):
+        st.subheader("❤️‍🔥 HRV e FC de repouso")
+        c1, c2 = st.columns(2)
+        with c1:
+            if "HRV_valor" in h.columns and h["HRV_valor"].notna().any():
+                fig = go.Figure()
+                fig.add_scatter(x=h["date"], y=h["HRV_valor"], mode="markers", name="HRV",
+                                marker=dict(color=PALETA[3], size=6))
+                if "HRV_lim_sup" in h.columns:
+                    fig.add_scatter(x=h["date"], y=h["HRV_lim_sup"], mode="lines", name="base sup.",
+                                    line=dict(color=C_NEUTRO, dash="dash", width=1))
+                    fig.add_scatter(x=h["date"], y=h["HRV_lim_inf"], mode="lines", name="base inf.",
+                                    line=dict(color=C_NEUTRO, dash="dash", width=1))
+                mm = h.set_index("date")["HRV_valor"].rolling(7, min_periods=3).mean()
+                fig.add_scatter(x=mm.index, y=mm, mode="lines", name="média 7d",
+                                line=dict(color=PALETA[0], width=3))
+                fig.update_layout(title="HRV (ms) — maior = melhor recuperação")
+                st.plotly_chart(style_fig(fig), use_container_width=True)
+        with c2:
+            fig = go.Figure()
+            if d is not None and len(d) and d["fc_repouso"].notna().any():
+                fig.add_scatter(x=d["date"], y=d["fc_repouso"], mode="markers", name="FC repouso",
+                                marker=dict(color=PALETA[1], size=6))
+                mm = d.set_index("date")["fc_repouso"].rolling(7, min_periods=3).mean()
+                fig.add_scatter(x=mm.index, y=mm, mode="lines", name="média 7d",
+                                line=dict(color=PALETA[0], width=3))
+                fig.update_layout(title="FC de repouso (bpm) — menor = melhor condicionamento")
+                st.plotly_chart(style_fig(fig), use_container_width=True)
+
+        # painel de status (fora da linha de base)
+        status_cols = [c for c in h.columns if c.endswith("_status")]
+        if status_cols:
+            nomes = {"HRV": "HRV", "HR": "FC repouso", "SPO2": "SpO₂",
+                     "SKIN_TEMP_C": "Temp. pele", "RESPIRATION": "Respiração"}
+            linhas = []
+            for c in status_cols:
+                pref = c[:-7]
+                vc = f"{pref}_valor"
+                if vc not in h.columns:
+                    continue
+                vals = h[vc].dropna()
+                if not len(vals):
+                    continue
+                fora = (h[c] == "ABOVE_BASELINE").sum() + (h[c] == "BELOW_BASELINE").sum()
+                linhas.append({
+                    "Métrica": nomes.get(pref, pref),
+                    "Atual": round(float(vals.iloc[-1]), 1),
+                    "Média": round(float(vals.mean()), 1),
+                    "Mín": round(float(vals.min()), 1),
+                    "Máx": round(float(vals.max()), 1),
+                    "Dias fora da base": int(fora),
+                })
+            if linhas:
+                st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
+
+    # ---------- SpO2, temperatura, respiração
+    extra = [("SPO2_valor", "🫁 SpO₂ (%)", 95), ("SKIN_TEMP_C_valor", "🌡️ Variação temp. pele (°C)", 0),
+             ("RESPIRATION_valor", "🫁 Respiração (rpm)", 15)]
+    disp = [(c, t, ref) for c, t, ref in extra if h is not None and c in h.columns and h[c].notna().any()]
+    if disp:
+        cols = st.columns(len(disp))
+        for col, (c, t, ref) in zip(cols, disp):
+            with col:
+                fig = px.scatter(h, x="date", y=c, trendline="lowess", labels={"date": "", c: ""},
+                                 color_discrete_sequence=[PALETA[2]])
+                fig.add_hline(y=ref, line_dash="dash", line_color=C_NEUTRO)
+                fig.update_layout(title=t)
+                st.plotly_chart(style_fig(fig, height=260), use_container_width=True)
+
+    # ---------- Body Battery
+    if d is not None and len(d) and d["bb_max"].notna().any():
+        st.subheader("🔋 Body Battery")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Pico médio", f"{d['bb_max'].mean():.0f}")
+        with c2:
+            st.metric("Mínimo médio", f"{d['bb_min'].mean():.0f}")
+        with c3:
+            st.metric("Recarga média", f"+{d['bb_recarga'].mean():.0f}")
+        with c4:
+            st.metric("Gasto médio", f"−{d['bb_gasto'].mean():.0f}")
+
+        fig = go.Figure()
+        fig.add_scatter(x=d["date"], y=d["bb_max"], mode="lines", line=dict(width=0), showlegend=False)
+        fig.add_scatter(x=d["date"], y=d["bb_min"], mode="lines", line=dict(width=0),
+                        fill="tonexty", fillcolor="rgba(26,188,156,0.25)", showlegend=False)
+        fig.add_scatter(x=d["date"], y=d["bb_max"], mode="lines", name="pico", line=dict(color=C_POS, width=1.5))
+        fig.add_scatter(x=d["date"], y=d["bb_min"], mode="lines", name="mínimo", line=dict(color=C_NEG, width=1.5))
+        fig.update_layout(yaxis=dict(title="BB", range=[0, 100]), title="Energia diária (faixa pico–mínimo)")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+        rec_sem = d.groupby("weekday")[["bb_recarga", "bb_gasto"]].mean().reindex(gd.DIAS_SEMANA)
+        fig = go.Figure()
+        fig.add_bar(x=ordem_dias_pt(), y=rec_sem["bb_recarga"], name="recarga", marker_color=C_POS)
+        fig.add_bar(x=ordem_dias_pt(), y=-rec_sem["bb_gasto"], name="gasto", marker_color=C_NEG)
+        fig.update_layout(barmode="relative", title="Recarga × gasto por dia da semana",
+                          legend=dict(orientation="h", y=1.12))
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # ---------- Estresse
+    if d is not None and len(d) and d["estresse_medio"].notna().any():
+        st.subheader("😰 Estresse")
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = go.Figure()
+            fig.add_scatter(x=d["date"], y=d["estresse_medio"], mode="markers", name="média diária",
+                            marker=dict(color=PALETA[3], size=6))
+            mm = d.set_index("date")["estresse_medio"].rolling(7, min_periods=3).mean()
+            fig.add_scatter(x=mm.index, y=mm, mode="lines", name="média 7d", line=dict(color=PALETA[0], width=3))
+            fig.add_hline(y=25, line_dash="dash", line_color=C_POS, annotation_text="baixo")
+            fig.add_hline(y=50, line_dash="dash", line_color=PALETA[2], annotation_text="médio")
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+        with c2:
+            dur = d[["descanso_min", "baixo_min", "medio_min", "alto_min"]].mean()
+            fig = go.Figure(go.Pie(labels=["Descanso", "Baixo", "Médio", "Alto"], values=dur.values,
+                                   hole=0.45, marker=dict(colors=[C_POS, "#f5a623", "#ef6c6c", "#c0392b"])))
+            fig.update_traces(textinfo="percent")
+            fig.update_layout(title="Distribuição do dia por nível de estresse")
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # ---------- Passos, pisos e intensidade
+    if d is not None and len(d) and d["passos"].notna().any():
+        st.subheader("👟 Passos, pisos e intensidade")
+        kpi([1] * 4, [
+            ("Passos/dia", f"{d['passos'].mean():,.0f}".replace(",", "."),
+             f"{d['atingiu_meta_passos'].mean() * 100:.0f}% da meta" if "atingiu_meta_passos" in d.columns else None),
+            ("Meta de passos", f"{d['meta_passos'].mean():,.0f}".replace(",", "."), None),
+            ("Pisos/dia", f"{d['pisos_subidos_m'].mean() / 3:.1f}", None),
+            ("Intensidade/dia", f"{(d['min_moderado'].fillna(0) + 2 * d['min_vigoroso'].fillna(0)).mean():.0f} min",
+             "meta OMS: ~30 min/dia"),
+        ])
+        fig = go.Figure()
+        fig.add_bar(x=d["date"], y=d["passos"], name="passos", marker_color=PALETA[1])
+        if "meta_passos" in d.columns:
+            fig.add_scatter(x=d["date"], y=d["meta_passos"], name="meta", mode="lines",
+                            line=dict(color=PALETA[3], dash="dash", width=2))
+        fig.update_layout(title="Passos diários × meta")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+        sem_int = d.copy()
+        sem_int["semana"] = sem_int["date"].dt.to_period("W").astype(str)
+        sem_int = sem_int.groupby("semana").agg(
+            min_tot=("min_moderado", lambda x: x.fillna(0).sum()),
+            min_vig=("min_vigoroso", lambda x: x.fillna(0).sum()),
+        )
+        sem_int["ponderada"] = sem_int["min_tot"] + 2 * sem_int["min_vig"]
+        meta_sem = d["meta_intensidade_semanal"].dropna().iloc[-1] if "meta_intensidade_semanal" in d and d["meta_intensidade_semanal"].notna().any() else 350
+        fig = go.Figure()
+        fig.add_bar(x=sem_int.index, y=sem_int["ponderada"], marker_color=PALETA[0], name="min/sem (vigoroso ×2)")
+        fig.add_hline(y=meta_sem, line_dash="dash", line_color=C_POS, annotation_text=f"meta {meta_sem:.0f} min")
+        fig.update_layout(title="Minutos de intensidade por semana")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # ---------- Energia diária (calorias) e hidratação
+    if d is not None and len(d) and d["kcal_total"].notna().any():
+        st.subheader("🔥 Balanço calórico e 💧 hidratação")
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = go.Figure()
+            fig.add_bar(x=d["date"], y=d["kcal_basal"], name="basal", marker_color=C_NEUTRO)
+            fig.add_bar(x=d["date"], y=d["kcal_ativa"], name="ativa", marker_color=PALETA[2])
+            fig.update_layout(barmode="stack", title="Calorias diárias (basal + ativa)",
+                              legend=dict(orientation="h", y=1.12))
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+        with c2:
+            hid = no_periodo(g.hydration)
+            if hid is not None and len(hid):
+                fig = go.Figure()
+                fig.add_bar(x=hid["date"], y=hid["agua_ml"] / 1000, name="registrar (L)", marker_color=PALETA[0])
+                fig.add_scatter(x=hid["date"], y=hid["suor_ml"] / 1000, name="suor estimado (L)",
+                                mode="markers", marker=dict(color=PALETA[3], size=6))
+                fig.update_layout(title="Hidratação registrada × perda por suor",
+                                  legend=dict(orientation="h", y=1.12))
+                st.plotly_chart(style_fig(fig), use_container_width=True)
+                st.caption(f"Média de suor por treino: **{hid['suor_ml'].mean():.0f} ml** "
+                           f"(estimativa do Garmin por atividade).")
+            else:
+                st.info("Sem registros de hidratação no período.")
+
+
+def view_correlacoes():
+    st.header("🔗 Correlações & Padrões")
+    m = g.master
+    if m is None or len(m) < 10:
+        st.warning("Dados insuficientes para correlações.")
+        return
+    m = m[(m.index >= P_INI) & (m.index <= P_FIM)]
+
+    rotulos = {
+        "treino_min": "Treino (min)", "treino_km": "Treino (km)", "treino_kcal": "Treino kcal",
+        "passos": "Passos", "fc_repouso": "FC repouso", "estresse_medio": "Estresse",
+        "sono_h": "Sono (h)", "profundo_h": "Sono profundo", "rem_h": "Sono REM",
+        "eficiencia_pct": "Eficiência sono", "score_overall": "Score sono",
+        "bb_max": "BB pico", "bb_min": "BB mín", "bb_recarga": "BB recarga",
+        "HRV_valor": "HRV", "agua_ml": "Água (ml)", "spo2_media": "SpO₂",
+        "divida_sono_h": "Dívida sono", "acwr": "ACWR",
+    }
+    colunas = [c for c in rotulos if c in m.columns and m[c].notna().sum() >= 10]
+
+    st.subheader("📊 Matriz de correlação (Pearson)")
+    corr = m[colunas].corr()
+    corr.index = [rotulos[c] for c in colunas]
+    corr.columns = [rotulos[c] for c in colunas]
+    fig = px.imshow(corr, color_continuous_scale=SEQ_DIVERG, zmin=-1, zmax=1, text_auto=".2f",
+                    aspect="auto")
+    fig.update_layout(height=max(500, 45 * len(colunas)))
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    with st.expander("ℹ️ Como interpretar"):
+        st.markdown(
+            "Correlação varia de **−1 a +1**: valores próximos de ±0,4 já indicam relação moderada; "
+            "acima de ±0,7, forte. **Correlação não é causa** — indica apenas que as variáveis "
+            "andam juntas nos seus dados."
+        )
+
+    # top pares
+    pares = []
+    for i in range(len(colunas)):
+        for j in range(i + 1, len(colunas)):
+            v = corr.iloc[i, j]
+            if pd.notna(v):
+                pares.append((corr.index[i], corr.index[j], v))
+    pares = sorted(pares, key=lambda x: -abs(x[2]))[:8]
+    st.subheader("🔝 Relações mais fortes")
+    c1, c2 = st.columns(2)
+    for i, (v1, v2, r) in enumerate(pares[:6]):
+        with (c1 if i % 2 == 0 else c2):
+            emoji = "🔥" if abs(r) >= 0.6 else ("💪" if abs(r) >= 0.35 else "•")
+            cor = C_POS if (r > 0) else C_NEG
+            st.markdown(
+                f"<div class='insight-card' style='border-left:4px solid {cor}'>"
+                f"<b>{emoji} {v1} ↔ {v2}: r = {r:+.2f}</b>"
+                f"<p>{'Sobem juntos' if r > 0 else 'Um sobe, o outro desce'} "
+                f"(|r| {'≥ 0,6 — forte' if abs(r) >= 0.6 else '≥ 0,35 — moderada'})</p></div>",
+                unsafe_allow_html=True,
+            )
+
+    # análise defasada
+    st.subheader("⏭️ Efeito no dia seguinte (defasagem de 1 dia)")
+    lags = [("treino_min_ontem", "Treino de ontem"), ("sono_h_ontem", "Sono de ontem"),
+            ("estresse_medio_ontem", "Estresse de ontem")]
+    alvos = [("bb_min", "BB mínimo hoje"), ("estresse_medio", "Estresse hoje"),
+             ("sono_h", "Sono hoje"), ("fc_repouso", "FC repouso hoje"), ("score_overall", "Score de sono hoje")]
+    linhas = []
+    for lag_c, lag_n in lags:
+        if lag_c not in m.columns:
+            continue
+        for alvo_c, alvo_n in alvos:
+            if alvo_c not in m.columns:
+                continue
+            par = m[[lag_c, alvo_c]].dropna()
+            if len(par) >= 20:
+                r = par[lag_c].corr(par[alvo_c])
+                if pd.notna(r):
+                    linhas.append({"Ontem": lag_n, "Hoje": alvo_n, "r": round(r, 2), "n": len(par)})
+    if linhas:
+        lg = pd.DataFrame(linhas).sort_values("r", key=abs, ascending=False)
+        fig = px.bar(lg, x="r", y=lg["Ontem"] + " → " + lg["Hoje"], orientation="h",
+                     color="r", color_continuous_scale=SEQ_DIVERG, range_color=[-0.5, 0.5],
+                     labels={"y": "", "x": "correlação"})
+        fig.update_layout(height=max(350, 28 * len(lg)))
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+        st.caption("Ex.: 'Sono de ontem → BB mínimo hoje' com r alto confirma que dormir bem recarrega a energia do dia seguinte.")
+
+    # scatter interativo
+    st.subheader("🔬 Explorador de dispersão")
+    opcoes = {rotulos[c]: c for c in colunas}
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        x_lbl = st.selectbox("Eixo X", list(opcoes), index=0)
+    with cc2:
+        default_y = list(opcoes).index("Sono (h)") if "Sono (h)" in opcoes else 1
+        y_lbl = st.selectbox("Eixo Y", list(opcoes), index=default_y)
+    fig = px.scatter(m.reset_index(), x=opcoes[x_lbl], y=opcoes[y_lbl], trendline="ols",
+                     labels={"date": "Data", "index": "Data"})
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    st.subheader("💡 Todos os insights automáticos")
+    for it in gerar_insights(g):
+        st.markdown(f"**{it['emoji']} {it['titulo']}** — {it['texto']}")
+
+
+def view_perfil():
+    st.header("🏆 Perfil, Recordes & Equipamentos")
+
+    # perfil
+    p = g.profile
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        st.markdown("<div class='kpi-card'>", unsafe_allow_html=True)
+        st.markdown(f"### 👤 {p.get('nome', '—')}")
+        altura = f"{p['altura_m']:.2f} m" if p.get("altura_m") else "—"
+        peso = f"{p['peso_kg']:.1f} kg" if p.get("peso_kg") else "—"
+        imc = f"IMC {p['bmi']:.1f}" if p.get("bmi") else ""
+        idade = f"{p['idade']} anos ·" if p.get("idade") else ""
+        st.markdown(
+            f"{idade} {p.get('genero', '')}  \n{altura} · {peso}  \n{imc}"
+            + (f"  \nFTP {p['ftp']} W" if p.get("ftp") else "")
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # fitness age
+    fa = no_periodo(g.fitness_age)
+    if fa is not None and len(fa) and "idade_bio" in fa.columns:
+        st.subheader("🧬 Idade fisiológica (Fitness Age)")
+        ult = fa.iloc[-1]
+        delta = ult["idade_bio"] - ult["idade_cronologica"]
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Idade cronológica", f"{ult['idade_cronologica']:.0f} anos")
+        with c2:
+            st.metric("Idade fisiológica", f"{ult['idade_bio']:.1f} anos",
+                      f"{delta:+.1f} anos", delta_color="inverse")
+        with c3:
+            st.metric("Potencial (estilo de vida saudável)", f"{ult['idade_bio_ideal']:.1f} anos")
+        fig = go.Figure()
+        fig.add_scatter(x=fa["date"], y=fa["idade_bio"], mode="lines", name="Idade fisiológica",
+                        line=dict(color=PALETA[0], width=3))
+        fig.add_scatter(x=fa["date"], y=fa["idade_cronologica"], mode="lines", name="Cronológica",
+                        line=dict(color=C_NEUTRO, dash="dash"))
+        fig.add_scatter(x=fa["date"], y=fa["idade_bio_ideal"], mode="lines", name="Ideal possível",
+                        line=dict(color=C_POS, dash="dot"))
+        fig.update_layout(title="Evolução da idade fisiológica")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    # VO2
+    vo2 = pd.concat([x for x in [no_periodo(g.vo2max)] if x is not None and len(x)]) if g.vo2max is not None else None
+    if vo2 is not None and len(vo2):
+        st.subheader("🫁 VO₂ Máx (capacidade aeróbica)")
+        fig = px.scatter(vo2, x="date", y="vo2", color="esporte",
+                         labels={"date": "", "vo2": "ml/kg/min"}, color_discrete_sequence=PALETA)
+        st.plotly_chart(style_fig(fig, height=300), use_container_width=True)
+        st.caption("Referência (homens 30-39): ruim <39 · média 41-45 · boa 47-51 · excelente ≥52 ml/kg/min.")
+
+    # PRs
+    if g.prs is not None and len(g.prs):
+        st.subheader("🏅 Recordes pessoais")
+        prs = g.prs.copy()
+        prs["quando"] = prs["quando"].dt.strftime("%d/%m/%Y")
+        prs.columns = ["Recorde", "Valor", "Unidade", "Data", "Atividade"]
+        prs["Valor"] = prs["Valor"].round(2)
+        st.dataframe(prs.drop(columns=["Atividade"]), use_container_width=True, hide_index=True)
+
+    # gear
+    if g.gear:
+        st.subheader("👟 Equipamentos")
+        for eq in g.gear:
+            pct = min(eq["km_usados"] / eq["vida_max_km"] * 100, 100) if eq["vida_max_km"] else None
+            st.markdown(f"**{eq['nome']}** ({eq['tipo'].lower()}, desde {eq['desde']}) — "
+                        f"{eq['km_usados']:.0f} km em {eq['atividades']} atividades"
+                        + (f" · vida útil {pct:.0f}%" if pct is not None else ""))
+            if pct is not None:
+                st.progress(min(pct / 100, 1.0), text=f"vida útil estimada: {eq['vida_max_km']:.0f} km")
+
+
+# ==================================================================== main
+st.markdown("<h1 class='main-header'>⚡ Garmin Connect Analytics</h1>", unsafe_allow_html=True)
+st.markdown(
+    f"<p class='sub-header'>{P_INI.strftime('%d/%m/%Y')} → {P_FIM.strftime('%d/%m/%Y')} · "
+    f"tema {theme_base()} (os gráficos acompanham)</p>",
+    unsafe_allow_html=True,
+)
+
+abas = st.tabs([
+    "🎯 Resumo",
+    "🏃 Atividades",
+    "⚡ Performance & Carga",
+    "😴 Sono",
+    "💗 Saúde & Energia",
+    "🔗 Correlações",
+    "🏆 Perfil & Recordes",
+])
+with abas[0]:
+    view_resumo()
+with abas[1]:
+    view_atividades()
+with abas[2]:
+    view_performance()
+with abas[3]:
+    view_sono()
+with abas[4]:
+    view_saude()
+with abas[5]:
+    view_correlacoes()
+with abas[6]:
+    view_perfil()
