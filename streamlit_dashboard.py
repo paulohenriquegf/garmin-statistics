@@ -62,6 +62,7 @@ def carregar_dados() -> GarminExport | None:
                 "…ou caminho da pasta extraída",
                 value=r"C:\Users\paulo\Downloads\d1332fc4-ec15-4bce-b1ce-e6c979982b81_1",
                 help="Caminho local da pasta com os dados (alternativa ao upload do ZIP).",
+                key="caminho_dados",
             )
         try:
             if uploaded is not None:
@@ -85,36 +86,136 @@ if g is None:
         "<p class='sub-header'>Análise completa de atividades, sono, saúde e recuperação</p>",
         unsafe_allow_html=True,
     )
-    st.info(
-        "Carregue o export dos seus dados do Garmin Connect para começar.\n\n"
-        "1. Acesse garmin.com/pt-BR/account/datamanagement/ → **Exportar seus dados**\n"
-        "2. Baixe o ZIP recebido por e-mail e faça o upload aqui (ou informe a pasta extraída)."
-    )
+
+    col_intro, col_export = st.columns([3, 2])
+    with col_intro:
+        st.markdown("### 🚀 Como começar")
+        st.markdown(
+            "Use a **barra lateral à esquerda** para carregar seus dados de uma das duas formas:\n\n"
+            "1. 📤 **Upload do ZIP** exportado do Garmin Connect, ou\n"
+            "2. 📁 **Caminho da pasta** extraída no seu computador"
+        )
+        st.markdown("### 🎯 O que você vai descobrir")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(
+                "#### 🏃 Atividades\n"
+                "- Volume, distância e calorias\n"
+                "- Zonas cardíacas do treino\n"
+                "- Efeito aeróbico/anaeróbico\n"
+                "- Ritmo e dinâmica de corrida\n"
+                "- Volume de musculação"
+            )
+        with c2:
+            st.markdown(
+                "#### 😴 Sono\n"
+                "- Fases (profundo, leve, REM)\n"
+                "- Score e sub-scores\n"
+                "- Eficiência e horário de dormir\n"
+                "- Dívida de sono acumulada\n"
+                "- SpO₂ e estresse noturno"
+            )
+        with c3:
+            st.markdown(
+                "#### 💗 Saúde\n"
+                "- HRV e FC de repouso\n"
+                "- Body Battery e estresse\n"
+                "- Passos e intensidade diária\n"
+                "- Idade fisiológica e VO₂ Máx\n"
+                "- Recordes e equipamentos"
+            )
+
+    with col_export:
+        st.markdown("### 📥 Como exportar seus dados do Garmin")
+        st.markdown(
+            "1. Acesse **garmin.com/pt-BR/account/datamanagement/**\n"
+            "   (ou: Conta → Gerenciamento de dados)\n"
+            "2. Clique em **Exportar seus dados** → *Solicitar exportação*\n"
+            "3. Aguarde o e-mail da Garmin — pode levar de **minutos a horas**\n"
+            "4. Baixe o ZIP pelo link do e-mail\n"
+            "5. Faça upload do ZIP aqui na barra lateral"
+        )
+        st.info(
+            "💡 O ZIP traz todo o seu histórico: atividades, sono, bem-estar diário, "
+            "recordes e equipamentos. O dashboard processa tudo automaticamente.",
+            icon="💡",
+        )
     st.stop()
 
 for w in g.warnings:
     st.warning(w)
 
 # --------------------------------------------------------- contexto global
-TODAS_DATAS = pd.to_datetime(
-    (g.master.index if g.master is not None and len(g.master) else pd.Series(dtype="datetime64[ns]"))
-)
+_idx = g.master.index if (g.master is not None and len(g.master)) else pd.DatetimeIndex([])
+TODAS_DATAS = pd.Series(pd.DatetimeIndex(_idx))
 DATA_MIN = TODAS_DATAS.min() if len(TODAS_DATAS) else pd.Timestamp("2025-01-01")
 DATA_MAX = TODAS_DATAS.max() if len(TODAS_DATAS) else pd.Timestamp.today()
 
+MESES_PT = {1: "jan", 2: "fev", 3: "mar", 4: "abr", 5: "mai", 6: "jun",
+            7: "jul", 8: "ago", 9: "set", 10: "out", 11: "nov", 12: "dez"}
+
+
+def _fmt_periodo(p):
+    """Rótulo amigável para um Period (mês ou semana)."""
+    if p == "Todos" or p == "Todas":
+        return p
+    if hasattr(p, "start_time"):
+        if p.freqstr.startswith("M"):
+            return f"{MESES_PT[p.month]}/{p.year}"
+        ini = p.start_time
+        return f"sem. {ini.strftime('%d/%m')}"
+    return str(p)
+
+
 with st.sidebar:
-    st.markdown("### 📅 Período")
-    periodo = st.date_input(
-        "Filtro global",
-        value=(DATA_MIN.date(), DATA_MAX.date()),
-        min_value=DATA_MIN.date(),
-        max_value=DATA_MAX.date(),
-        help="Aplica a todas as abas.",
+    st.markdown("### 📅 Período (todas as abas)")
+    modo_filtro = st.radio(
+        "Modo", ["Ano / Mês / Semana", "Intervalo de datas"],
+        horizontal=True, label_visibility="collapsed", key="filtro_modo",
     )
-    if len(periodo) == 2:
-        P_INI, P_FIM = pd.Timestamp(periodo[0]), pd.Timestamp(periodo[1])
+
+    if modo_filtro == "Ano / Mês / Semana":
+        anos = ["Todos"] + sorted(TODAS_DATAS.dt.year.unique().tolist(), reverse=True)
+        ano_sel = st.selectbox("📅 Ano", anos, key="filtro_ano")
+
+        base = TODAS_DATAS if ano_sel == "Todos" else TODAS_DATAS[TODAS_DATAS.dt.year == int(ano_sel)]
+        meses = ["Todos"] + sorted(base.dt.to_period("M").unique().tolist(), reverse=True)
+        mes_sel = st.selectbox("📆 Mês", meses, format_func=_fmt_periodo, key="filtro_mes")
+
+        if mes_sel != "Todos":
+            base = base[base.dt.to_period("M") == mes_sel]
+        semanas = ["Todas"] + sorted(base.dt.to_period("W").unique().tolist(), reverse=True)
+        sem_sel = st.selectbox("🗓️ Semana", semanas, format_func=_fmt_periodo, key="filtro_semana")
+
+        if sem_sel != "Todas":
+            P_INI, P_FIM = sem_sel.start_time.normalize(), sem_sel.end_time.normalize()
+        elif mes_sel != "Todos":
+            P_INI, P_FIM = mes_sel.start_time.normalize(), mes_sel.end_time.normalize()
+        elif ano_sel != "Todos":
+            P_INI = pd.Timestamp(int(ano_sel), 1, 1)
+            P_FIM = pd.Timestamp(int(ano_sel), 12, 31) + pd.Timedelta(hours=23, minutes=59)
+        else:
+            P_INI, P_FIM = DATA_MIN.normalize(), DATA_MAX.normalize()
     else:
-        P_INI, P_FIM = DATA_MIN, DATA_MAX
+        periodo = st.date_input(
+            "Intervalo",
+            value=(DATA_MIN.date(), DATA_MAX.date()),
+            min_value=DATA_MIN.date(),
+            max_value=DATA_MAX.date(),
+            help="Aplica a todas as abas.",
+        )
+        if len(periodo) == 2:
+            P_INI = pd.Timestamp(periodo[0])
+            P_FIM = pd.Timestamp(periodo[1]) + pd.Timedelta(hours=23, minutes=59)
+        else:
+            P_INI, P_FIM = DATA_MIN.normalize(), DATA_MAX.normalize()
+
+    st.caption(f"Analisando: **{P_INI.strftime('%d/%m/%Y')} → {P_FIM.strftime('%d/%m/%Y')}**")
+    if st.button("🔄 Limpar filtros", key="limpar_filtros"):
+        st.session_state.filtro_ano = "Todos"
+        st.session_state.filtro_mes = "Todos"
+        st.session_state.filtro_semana = "Todas"
+        st.rerun()
 
     if g.profile:
         p = g.profile
@@ -128,6 +229,14 @@ with st.sidebar:
             + (f" · IMC {p['bmi']:.1f}" if p.get("bmi") else "")
         )
     st.markdown("---")
+    st.markdown("---")
+    with st.expander("ℹ️ Como exportar dados do Garmin"):
+        st.markdown(
+            "1. Acesse **garmin.com/pt-BR/account/datamanagement/**\n"
+            "2. **Exportar seus dados** → *Solicitar exportação*\n"
+            "3. Aguarde o e-mail da Garmin (minutos a horas)\n"
+            "4. Baixe o ZIP e faça o upload na barra lateral"
+        )
     st.caption("Desenvolvido com Streamlit + Plotly")
 
 
@@ -254,14 +363,20 @@ def view_resumo():
     kpi([1] * 8, itens)
     st.markdown("---")
 
-    # --- evolução mensal (volume + distância)
+    # --- evolução (granularidade adaptativa ao período filtrado)
     if a is not None and len(a):
-        st.subheader("Evolução mensal")
-        mensal = a.groupby("month").agg(qtd=("activityId", "count"), min=("duracao_min", "sum"),
-                                        km=("dist_km", "sum"), kcal=("kcal", "sum")).reset_index()
+        span_dias = (P_FIM - P_INI).days
+        freq, rotulo = ("W", "Evolução semanal") if span_dias <= 120 else ("M", "Evolução mensal")
+        per = a["start"].dt.to_period(freq)
+        mensal = a.groupby(per).agg(qtd=("activityId", "count"), min=("duracao_min", "sum"),
+                                    km=("dist_km", "sum"), kcal=("kcal", "sum")).reset_index()
+        mensal["start"] = mensal["start"].map(
+            lambda p: f"{MESES_PT[p.month]}/{p.year}" if freq == "M" else p.start_time.strftime("%d/%m/%y")
+        )
+        st.subheader(rotulo)
         fig = go.Figure()
-        fig.add_bar(x=mensal["month"], y=mensal["min"], name="Minutos", marker_color=PALETA[1])
-        fig.add_scatter(x=mensal["month"], y=mensal["km"], name="Distância (km)", yaxis="y2",
+        fig.add_bar(x=mensal["start"], y=mensal["min"], name="Minutos", marker_color=PALETA[1])
+        fig.add_scatter(x=mensal["start"], y=mensal["km"], name="Distância (km)", yaxis="y2",
                         mode="lines+markers", line=dict(color=PALETA[2], width=3))
         fig.update_layout(
             yaxis=dict(title="Minutos"),
@@ -272,7 +387,7 @@ def view_resumo():
 
     # --- últimos 30 dias: energia vs estresse vs sono
     if d is not None and len(d):
-        st.subheader("Últimos 30 dias — energia, estresse e sono")
+        st.subheader("Energia, estresse e sono — fim do período selecionado")
         dd = d[d["date"] >= ult30]
         ss = s[s["date"] >= ult30][["date", "sono_h"]] if s is not None and len(s) else None
         fig = go.Figure()
@@ -371,12 +486,17 @@ def view_atividades():
     resumo.columns = ["Tipo", "Qtd", "Tempo (min)", "Tempo médio", "km", "kcal", "kcal médio", "FC média"]
     st.dataframe(resumo.round(1), use_container_width=True, hide_index=True)
 
-    st.subheader("🔎 Volume semanal")
-    sem = af.groupby("week").agg(minutos=("duracao_min", "sum"), qtd=("activityId", "count"),
-                                 kcal=("kcal", "sum")).reset_index()
+    st.subheader("🔎 Volume por período")
+    span_dias = (P_FIM - P_INI).days
+    freq = "D" if span_dias <= 60 else "W"
+    rot = "dia" if freq == "D" else "semana"
+    per = af["start"].dt.to_period(freq)
+    sem = af.groupby(per).agg(minutos=("duracao_min", "sum"), qtd=("activityId", "count"),
+                              kcal=("kcal", "sum")).reset_index()
+    sem["start"] = sem["start"].dt.strftime("%d/%m/%y")
     fig = go.Figure()
-    fig.add_bar(x=sem["week"], y=sem["minutos"], name="Minutos/semana", marker_color=PALETA[0])
-    fig.add_scatter(x=sem["week"], y=sem["kcal"], name="kcal/semana", yaxis="y2",
+    fig.add_bar(x=sem["start"], y=sem["minutos"], name=f"Minutos/{rot}", marker_color=PALETA[0])
+    fig.add_scatter(x=sem["start"], y=sem["kcal"], name=f"kcal/{rot}", yaxis="y2",
                     mode="lines", line=dict(color=PALETA[3], width=2))
     fig.update_layout(yaxis=dict(title="Minutos"), yaxis2=dict(title="kcal", overlaying="y", side="right"),
                       legend=dict(orientation="h", y=1.12))
@@ -824,6 +944,9 @@ def view_correlacoes():
         "divida_sono_h": "Dívida sono", "acwr": "ACWR",
     }
     colunas = [c for c in rotulos if c in m.columns and m[c].notna().sum() >= 10]
+    if len(colunas) < 2:
+        st.warning("Período muito curto para análise de correlação — selecione pelo menos um mês.")
+        return
 
     st.subheader("📊 Matriz de correlação (Pearson)")
     corr = m[colunas].corr()
@@ -952,7 +1075,7 @@ def view_perfil():
         st.plotly_chart(style_fig(fig), use_container_width=True)
 
     # VO2
-    vo2 = pd.concat([x for x in [no_periodo(g.vo2max)] if x is not None and len(x)]) if g.vo2max is not None else None
+    vo2 = no_periodo(g.vo2max) if g.vo2max is not None else None
     if vo2 is not None and len(vo2):
         st.subheader("🫁 VO₂ Máx (capacidade aeróbica)")
         fig = px.scatter(vo2, x="date", y="vo2", color="esporte",
