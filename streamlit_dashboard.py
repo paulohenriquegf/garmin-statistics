@@ -352,7 +352,6 @@ def view_resumo():
     d = no_periodo(g.daily)
 
     # --- KPIs principais
-    ult30 = max(P_FIM - pd.Timedelta(days=30), P_INI)
     kcal_atv = d["kcal_ativa"].mean() if d is not None and len(d) else None
 
     itens = [
@@ -399,23 +398,43 @@ def view_resumo():
 
     # --- últimos 30 dias: energia vs estresse vs sono
     if d is not None and len(d):
-        st.subheader("Energia, estresse e sono — fim do período selecionado")
-        dd = d[d["date"] >= ult30]
-        ss = s[s["date"] >= ult30][["date", "sono_h"]] if s is not None and len(s) else None
-        fig = go.Figure()
-        fig.add_bar(x=dd["date"], y=dd["bb_max"], name="BB máx", marker_color=C_POS, opacity=0.55)
-        fig.add_bar(x=dd["date"], y=dd["bb_min"], name="BB mín", marker_color=C_NEG, opacity=0.55)
-        fig.add_scatter(x=dd["date"], y=dd["estresse_medio"], name="Estresse", mode="lines",
-                        line=dict(color=PALETA[3], width=2), yaxis="y2")
-        if ss is not None and len(ss):
-            fig.add_scatter(x=ss["date"], y=ss["sono_h"], name="Sono (h)", mode="lines",
-                            line=dict(color=PALETA[0], width=2, dash="dot"), yaxis="y2")
-        fig.update_layout(
-            yaxis=dict(title="Body Battery", range=[0, 100]),
-            yaxis2=dict(title="Estresse / Sono h", overlaying="y", side="right"),
-            barmode="overlay", legend=dict(orientation="h", y=1.12),
-        )
-        st.plotly_chart(style_fig(fig), use_container_width=True)
+        # Janela ancorada no ÚLTIMO DIA COM DADOS (o export pode terminar
+        # antes do fim do período filtrado, o que deixava o gráfico vazio).
+        fim_dados = d["date"].max()
+        ini_jan = max(fim_dados - pd.Timedelta(days=30), P_INI)
+        dd = d[d["date"] >= ini_jan]
+        dd = dd[dd[["bb_max", "bb_min", "estresse_medio"]].notna().any(axis=1)]
+        ss = (s[s["date"] >= ini_jan][["date", "sono_h"]].dropna(subset=["sono_h"])
+              if s is not None and len(s) else None)
+        if len(dd) or (ss is not None and len(ss)):
+            st.subheader("Energia, estresse e sono — fim do período selecionado")
+            fig = go.Figure()
+            if len(dd) and dd["bb_max"].notna().any():
+                fig.add_bar(x=dd["date"], y=dd["bb_max"], name="BB máx", marker_color=C_POS, opacity=0.55,
+                            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Pico de energia: %{y:.0f}<extra></extra>")
+            if len(dd) and dd["bb_min"].notna().any():
+                fig.add_bar(x=dd["date"], y=dd["bb_min"], name="BB mín", marker_color=C_NEG, opacity=0.55,
+                            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Energia mínima: %{y:.0f}<extra></extra>")
+            if len(dd) and dd["estresse_medio"].notna().any():
+                fig.add_scatter(x=dd["date"], y=dd["estresse_medio"], name="Estresse", mode="lines",
+                                line=dict(color=PALETA[3], width=2), yaxis="y2",
+                                hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Estresse médio: %{y:.0f}<extra></extra>")
+            if ss is not None and len(ss):
+                fig.add_scatter(x=ss["date"], y=ss["sono_h"], name="Sono (h)", mode="lines",
+                                line=dict(color=PALETA[0], width=2, dash="dot"), yaxis="y2",
+                                hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Sono: %{y:.1f} h<extra></extra>")
+            fig.update_layout(
+                yaxis=dict(title="Body Battery", range=[0, 100]),
+                yaxis2=dict(title="Estresse / Sono h", overlaying="y", side="right"),
+                barmode="overlay", legend=dict(orientation="h", y=1.12),
+            )
+            st.plotly_chart(style_fig(fig), use_container_width=True)
+            explica(
+                "Últimos 30 dias **com registro** dentro do período filtrado. Barras = Body Battery "
+                "do dia (pico × mínimo); linhas = estresse médio e horas de sono."
+            )
+        else:
+            st.info("Sem dados de energia, estresse ou sono nos últimos 30 dias do período selecionado.")
 
     # --- insights
     st.subheader("💡 Destaques dos seus dados")
