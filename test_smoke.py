@@ -5,6 +5,9 @@ Use SEM_STATS=1 para simular ambiente sem statsmodels (fallback de trendlines).
 import os
 import sys
 
+DADOS = r"C:\Users\paulo\Downloads\d1332fc4-ec15-4bce-b1ce-e6c979982b81_1"
+os.environ["GARMIN_DADOS"] = DADOS
+
 if os.environ.get("SEM_STATS"):
     class _Bloqueia:
         def find_module(self, name, path=None):
@@ -18,14 +21,9 @@ if os.environ.get("SEM_STATS"):
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
-DADOS = r"C:\Users\paulo\Downloads\d1332fc4-ec15-4bce-b1ce-e6c979982b81_1"
-
 
 def rodar(modo="Ano / Mês / Semana", ano=None, mes=None, semana=None):
     at = AppTest.from_file("streamlit_dashboard.py", default_timeout=120)
-    at.run()
-    ti = next(t for t in at.text_input if t.key == "caminho_dados")
-    ti.set_value(DADOS)
     at.run()
     rb = next(r for r in at.radio if r.key == "filtro_modo")
     rb.set_value(modo)

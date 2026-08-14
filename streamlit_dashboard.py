@@ -13,6 +13,7 @@ Como usar:
 
 import datetime as dt
 import io
+import os
 import tempfile
 from pathlib import Path
 
@@ -66,24 +67,20 @@ def _load_folder(path: str, mtime: float) -> GarminExport:
 def carregar_dados() -> GarminExport | None:
     with st.sidebar:
         uploaded = st.file_uploader("📤 Upload do ZIP do Garmin Connect", type=["zip"])
-        caminho = None
-        if uploaded is None:
-            caminho = st.text_input(
-                "…ou caminho da pasta extraída",
-                value=r"C:\Users\paulo\Downloads\d1332fc4-ec15-4bce-b1ce-e6c979982b81_1",
-                help="Caminho local da pasta com os dados (alternativa ao upload do ZIP).",
-                key="caminho_dados",
-            )
         try:
             if uploaded is not None:
                 with st.spinner("🔄 Processando export…"):
                     return _load_zip_bytes(uploaded.getvalue())
+            # Alternativa sem UI para uso local/testes: variável de ambiente
+            # GARMIN_DADOS apontando para a pasta extraída ou para o ZIP.
+            caminho = os.environ.get("GARMIN_DADOS")
             if caminho and Path(caminho).is_dir():
                 with st.spinner("🔄 Processando export…"):
                     mt = max(f.stat().st_mtime for f in Path(caminho).rglob("*") if f.is_file())
                     return _load_folder(caminho, mt)
-            if caminho:
-                st.warning("Pasta não encontrada.")
+            if caminho and caminho.lower().endswith(".zip") and Path(caminho).is_file():
+                with st.spinner("🔄 Processando export…"):
+                    return _load_zip_bytes(Path(caminho).read_bytes())
         except Exception as e:
             st.error(f"Erro ao carregar dados: {e}")
     return None
