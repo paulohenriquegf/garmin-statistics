@@ -25,8 +25,8 @@ import streamlit as st
 import garmin_data as gd
 from garmin_data import GarminExport
 from viz import (
-    C_NEG, C_NEUTRO, C_POS, PALETA, SEQ_AZUL, SEQ_DIVERG, SEQ_VERDE,
-    SEQ_VERM, card_titulo_icon, fmt_hora_frac, fmt_min, fmt_ritmo,
+    C_NEG, C_NEUTRO, C_POS, GLOSSARIO, PALETA, SEQ_AZUL, SEQ_DIVERG, SEQ_VERDE,
+    SEQ_VERM, card_titulo_icon, explica, fmt_hora_frac, fmt_min, fmt_ritmo,
     inject_css, kpi, linha_resumo_periodo, media_circular_horario,
     ordem_dias_pt, rotulo_dia, rotulo_dia_curto, style_fig, theme_base,
 )
@@ -361,6 +361,11 @@ def view_resumo():
         ("🔥 kcal ativas/dia", f"{kcal_atv:.0f}" if kcal_atv is not None and pd.notna(kcal_atv) else "—", None),
     ]
     kpi([1] * 8, itens)
+    explica(
+        "**FC de repouso**: quanto menor, melhor o condicionamento (60–100 normal; atletas 40–60) · "
+        "**Estresse**: índice 0–100, abaixo de 50 é saudável · **kcal ativas**: gasto por movimento, "
+        "a parte que você controla. Definições completas na aba 📖 Glossário."
+    )
     st.markdown("---")
 
     # --- evolução (granularidade adaptativa ao período filtrado)
@@ -449,6 +454,11 @@ def view_atividades():
         hr = af.loc[af["fc_media"] > 0, "fc_media"]
         st.metric("FC média", f"{hr.mean():.0f} bpm" if len(hr) else "—")
 
+    explica(
+        "**FC média/máx** = batimentos por minuto durante o treino (comparar com o esforço, não com outras pessoas) · "
+        "**kcal** = gasto energético real da atividade. O mapa de calor mostra quando você costuma treinar."
+    )
+
     col1, col2 = st.columns(2)
     with col1:
         cont = af["tipo"].value_counts()
@@ -521,6 +531,11 @@ def view_performance():
 
     # --- zonas cardíacas
     st.subheader("❤️ Distribuição de treino por zona cardíaca")
+    explica(
+        "Zonas de FC = faixas de intensidade em % da sua FC máxima (método HR_MAX). "
+        "**Z1–Z2** constroem base aeróbica (leve) · **Z3** ritmo moderado · **Z4** limiar (forte sustentável) · "
+        "**Z5** VO₂ (máximo curto). A distribuição mostra qual 'motor' você tem treinado."
+    )
     zcols = [f"z{i}_min" for i in range(7)]
     zlabels = ["Abaixo Z1", "Z1 (leve)", "Z2 (aeróbico)", "Z3 (tempo)", "Z4 (limiar)", "Z5 (VO2)", "Acima Z5"]
     zsum = a[zcols].sum()
@@ -548,11 +563,17 @@ def view_performance():
                 )
             tempo_zona = pd.DataFrame({"Zona": zlabels, "Minutos": zsum.values})
             fig = px.bar(tempo_zona, x="Zona", y="Minutos", color_discrete_sequence=[PALETA[1]])
+            fig.update_traces(hovertemplate="Zona %{x}: %{y:.0f} min<extra></extra>")
             st.plotly_chart(style_fig(fig), use_container_width=True)
 
     # --- efeito de treino
     if a["te_label"].notna().any():
         st.subheader("🧪 Efeito de treino (aeróbico/anaeróbico)")
+        explica(
+            "O **efeito de treino** classifica o estímulo da sessão: RECOVERY (recuperação ativa), "
+            "AEROBIC_BASE (resistência), TEMPO (ritmo), LIMIAR e ANAEROBIC (potência curta). "
+            "Semana ideal mistura base aeróbica com 1–2 sessões de intensidade."
+        )
         te = a.dropna(subset=["te_label"])
         cont = te["te_label"].value_counts()
         c1, c2 = st.columns([2, 3])
@@ -570,6 +591,10 @@ def view_performance():
     # --- corrida
     corridas = a[a["tipo"].isin(gd.TIPOS_CORRIDA) & (a["dist_km"] > 0)]
     st.subheader("🏃‍♂️ Corrida")
+    explica(
+        "**Ritmo** em min/km — quanto MENOR, mais rápido. A tendência desconta variações de distância; "
+        "evoluir é correr o mesmo ritmo com FC média menor."
+    )
     if len(corridas):
         corridas = corridas.sort_values("start")
         c1, c2, c3, c4 = st.columns(4)
@@ -592,6 +617,17 @@ def view_performance():
                              labels={"start": "", "ritmo_min_km": "ritmo (min/km)", "color": "km"},
                              color_discrete_sequence=PALETA,
                              title="Evolução do ritmo (menor = mais rápido)")
+            fig.update_traces(
+                selector=dict(mode="markers"),
+                customdata=np.stack([
+                    corridas["start"].dt.strftime("%d/%m/%Y"),
+                    corridas["ritmo_min_km"].map(fmt_ritmo),
+                    corridas["dist_km"].round(2).map("{:.1f} km".format),
+                    corridas["duracao_min"].map(fmt_min),
+                ], axis=-1),
+                hovertemplate=("<b>%{customdata[0]}</b><br>Ritmo: %{customdata[1]} /km"
+                               "<br>%{customdata[2]} · %{customdata[3]}<extra></extra>"),
+            )
             fig.update_yaxes(autorange="reversed")
             st.plotly_chart(style_fig(fig), use_container_width=True)
         with col2:
@@ -606,6 +642,11 @@ def view_performance():
         din_disp = [c for c in din if corridas[c].notna().sum() >= 3]
         if din_disp:
             with st.expander("🔬 Dinâmica de corrida (cadência, contato, oscilação)", expanded=False):
+                explica(
+                    "**Cadência**: passos/min, referência 170–180 · **GCT**: tempo do pé no chá, "
+                    "menor = mais eficiente (< 300 ms bom) · **Oscilação vertical**: quanto o corpo 'quica', "
+                    "menor = menos energia desperdiçada."
+                )
                 cols = st.columns(2)
                 for i, c in enumerate(din_disp):
                     with cols[i % 2]:
@@ -635,9 +676,13 @@ def view_performance():
     if g.master is not None and "acwr" in g.master.columns:
         m = g.master[(g.master.index >= P_INI) & (g.master.index <= P_FIM)]
         fig = go.Figure()
-        fig.add_bar(x=m.index, y=m["carga_7d_min"], name="Carga 7 dias (min)", marker_color=PALETA[1], opacity=0.6)
+        fig.add_bar(x=m.index, y=m["carga_7d_min"], name="Carga 7 dias (min)", marker_color=PALETA[1],
+                    opacity=0.6,
+                    hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Carga 7 dias: %{y:.0f} min<extra></extra>")
         fig.add_scatter(x=m.index, y=m["acwr"], name="ACWR", yaxis="y2", mode="lines",
-                        line=dict(color=PALETA[3], width=2))
+                        line=dict(color=PALETA[3], width=2),
+                        hovertemplate=("<b>%{x|%d/%m/%Y}</b><br>ACWR: %{y:.2f}"
+                                       "<br>(0,8–1,3 = seguro)<extra></extra>"))
         fig.add_hrect(y0=0.8, y1=1.3, line_width=0, fillcolor=C_POS, opacity=0.15,
                       yref="y2", annotation_text="zona ideal 0,8–1,3")
         fig.update_layout(
@@ -671,12 +716,18 @@ def view_sono():
         ("Horário de dormir", fmt_hora_frac(media_dormir),
          f"acorda ~{fmt_hora_frac(media_acordar)}"),
     ])
+    explica(
+        "**Eficiência**: % do tempo na cama efetivamente dormindo (≥ 85% é bom) · "
+        "**Profundo**: reparo físico, ideal 13–23% do sono · **REM**: memória/aprendizado, ideal 20–25% · "
+        "**Score**: nota 0–100 do Garmin (> 80 ótimo)."
+    )
 
     col1, col2 = st.columns(2)
     with col1:
         fig = go.Figure()
         fig.add_scatter(x=s["date"], y=s["sono_h"], mode="markers", name="Sono (h)",
-                        marker=dict(color=PALETA[1], size=6))
+                        marker=dict(color=PALETA[1], size=6),
+                        hovertemplate="<b>%{x|%d/%m/%Y}</b><br>%{y:.1f} h de sono<extra></extra>")
         mm = s.set_index("date")["sono_h"].rolling(7, min_periods=3).mean()
         fig.add_scatter(x=mm.index, y=mm, mode="lines", name="Média móvel 7d",
                         line=dict(color=PALETA[0], width=3))
@@ -690,7 +741,8 @@ def view_sono():
         ordem = [("leve_h", "Leve", "#6ea8fe"), ("profundo_h", "Profundo", "#1e3a8a"),
                  ("rem_h", "REM", "#b58cda")]
         for col, nome, cor in ordem:
-            fig.add_bar(x=s["date"], y=s[col], name=nome, base=base, marker_color=cor)
+            fig.add_bar(x=s["date"], y=s[col], name=nome, base=base, marker_color=cor,
+                        hovertemplate="<b>%{x|%d/%m/%Y}</b><br>" + nome + ": %{y:.1f} h<extra></extra>")
             base = base + s[col].fillna(0).values
         fig.update_layout(barmode="stack", title="Composição do sono")
         st.plotly_chart(style_fig(fig), use_container_width=True)
@@ -700,6 +752,12 @@ def view_sono():
     with c1:
         fig = px.scatter(x=s["date"], y=s["hora_dormir"] % 24, trendline="lowess",
                          labels={"x": "", "y": "hora"}, color_discrete_sequence=[PALETA[5]])
+        fig.update_traces(
+            selector=dict(mode="markers"),
+            customdata=s["hora_dormir"].map(fmt_hora_frac),
+            hovertemplate="<b>%{x|%d/%m/%Y}</b><br>Dormiu às %{customdata}<extra></extra>",
+        )
+        fig.update_yaxes(tickformat=":.0f", ticksuffix="h")
         fig.add_hline(y=media_circular_horario(s["hora_dormir"]) % 24, line_dash="dash", line_color=C_POS)
         st.plotly_chart(style_fig(fig), use_container_width=True)
     with c2:
@@ -710,16 +768,39 @@ def view_sono():
     st.caption(f"Desvio-padrão do horário de dormir: **±{s['hora_dormir'].std():.1f} h** — "
                "quanto menor, mais estável o ritmo circadiano.")
 
-    st.subheader("📉 Dívida de sono acumulada (alvo 7h30)")
-    div = s.set_index("date")["divida_sono_h"].cumsum().reset_index()
-    fig = px.area(div, x="date", y="divida_sono_h", color_discrete_sequence=[PALETA[3]])
-    st.plotly_chart(style_fig(fig), use_container_width=True)
+    st.subheader("📉 Saldo de sono por noite (alvo 7h30)")
+    div = s[["date", "divida_sono_h"]].dropna()
+    if len(div):
+        fig = go.Figure()
+        fig.add_bar(
+            x=div["date"], y=-div["divida_sono_h"],
+            marker_color=[
+                C_NEG if v > 0.5 else (C_POS if v < -0.5 else C_NEUTRO)
+                for v in div["divida_sono_h"]
+            ],
+            name="Saldo da noite",
+            hovertemplate=("<b>%{x|%d/%m/%Y}</b><br>%{y:+.1f} h vs alvo"
+                           "<br>(negativo = noite com dívida)<extra></extra>"),
+        )
+        fig.add_scatter(
+            x=div["date"], y=(-div["divida_sono_h"]).rolling(7, min_periods=3).mean(),
+            mode="lines", line=dict(color=PALETA[1], width=3), name="Média móvel 7 noites",
+            hovertemplate="Média 7 noites: %{y:+.1f} h<extra></extra>",
+        )
+        fig.add_hline(y=0, line_dash="dot", line_color=C_NEUTRO)
+        fig.update_yaxes(title="horas vs alvo (+ sobra / − dívida)")
+        st.plotly_chart(style_fig(fig), use_container_width=True)
+        explica(
+            "Cada barra é uma noite: **acima de zero** dormiu além da meta (sobra), **abaixo** ficou "
+            "devendo. A linha azul é a tendência de 7 noites — caindo = privação se acumulando."
+        )
 
     # sub-scores e sinais noturnos
     score_cols = [c for c in ["score_quality", "score_duration", "score_recovery", "score_deep",
                               "score_rem", "score_restfulness", "score_interruptions"] if c in s.columns]
     if s[score_cols].notna().any().any():
         st.subheader("🧩 Onde o seu sono perde pontos")
+        explica("Cada componente é avaliado de 0–100 — a barra mais baixa é o elo mais fraco da sua noite.")
         medias = s[score_cols].mean().sort_values()
         nomes = {"score_quality": "Qualidade", "score_duration": "Duração", "score_recovery": "Recuperação",
                  "score_deep": "Profundo", "score_rem": "REM", "score_restfulness": "Descanso",
@@ -734,6 +815,10 @@ def view_sono():
     disp = [(c, t, u, ref) for c, t, u, ref in sinais if c in s.columns and s[c].notna().any()]
     if disp:
         st.subheader("🩺 Sinais noturnos")
+        explica(
+            "**SpO₂** noturna normal ≥ 95% (mínimos abaixo de 90% com frequência merecem atenção médica) · "
+            "**estresse durante o sono** abaixo de ~30 indica descanso de verdade."
+        )
         cols = st.columns(len(disp))
         for col, (c, t, u, ref) in zip(cols, disp):
             with col:
@@ -748,6 +833,11 @@ def view_saude():
     # ---------- HRV e FC repouso (diário + status)
     if h is not None and len(h):
         st.subheader("❤️‍🔥 HRV e FC de repouso")
+        explica(
+            "**HRV** = variação entre um batimento e outro: quanto MAIOR, melhor a recuperação. "
+            "A faixa tracejada é a SUA linha de base — compare-se com ela, não com outras pessoas. "
+            "**FC de repouso**: quanto menor, melhor o condicionamento."
+        )
         c1, c2 = st.columns(2)
         with c1:
             if "HRV_valor" in h.columns and h["HRV_valor"].notna().any():
@@ -799,6 +889,10 @@ def view_saude():
                     "Dias fora da base": int(fora),
                 })
             if linhas:
+                explica(
+                    "'Dias fora da base' conta leituras acima/abaixo da sua própria média pessoal — "
+                    "muitos dias fora indicam mudança de estado (doença, estresse, supercompensação)."
+                )
                 st.dataframe(pd.DataFrame(linhas), use_container_width=True, hide_index=True)
 
     # ---------- SpO2, temperatura, respiração
@@ -818,6 +912,10 @@ def view_saude():
     # ---------- Body Battery
     if d is not None and len(d) and d["bb_max"].notna().any():
         st.subheader("🔋 Body Battery")
+        explica(
+            "Energia corporal 0–100: a **recarga** vem do sono e do descanso; o **gasto** vem de estresse "
+            "e atividade. Pico alto + gasto controlado = boa gestão de energia."
+        )
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.metric("Pico médio", f"{d['bb_max'].mean():.0f}")
@@ -848,6 +946,10 @@ def view_saude():
     # ---------- Estresse
     if d is not None and len(d) and d["estresse_medio"].notna().any():
         st.subheader("😰 Estresse")
+        explica(
+            "Escala 0–100 derivada do sistema nervoso: **0–25** descanso · **26–50** baixo · "
+            "**51–75** médio · **76–100** alto."
+        )
         c1, c2 = st.columns(2)
         with c1:
             fig = go.Figure()
@@ -898,10 +1000,19 @@ def view_saude():
         fig.add_hline(y=meta_sem, line_dash="dash", line_color=C_POS, annotation_text=f"meta {meta_sem:.0f} min")
         fig.update_layout(title="Minutos de intensidade por semana")
         st.plotly_chart(style_fig(fig), use_container_width=True)
+        explica(
+            "Minutos de intensidade somam moderado + 2× vigoroso. A OMS recomenda "
+            "150–300 min moderados (ou 75–150 vigorosos) por semana."
+        )
 
     # ---------- Energia diária (calorias) e hidratação
     if d is not None and len(d) and d["kcal_total"].notna().any():
         st.subheader("🔥 Balanço calórico e 💧 hidratação")
+        explica(
+            "Calorias **basais** = o que o corpo gasta só por existir (fixas) · calorias **ativas** = "
+            "exercício e movimento (a única parte que você controla). "
+            "O **suor** é a perda estimada por treino — repo o equivalente em água."
+        )
         c1, c2 = st.columns(2)
         with c1:
             fig = go.Figure()
@@ -1054,6 +1165,10 @@ def view_perfil():
     fa = no_periodo(g.fitness_age)
     if fa is not None and len(fa) and "idade_bio" in fa.columns:
         st.subheader("🧬 Idade fisiológica (Fitness Age)")
+        explica(
+            "Idade que o corpo 'tem' segundo VO₂, IMC e FC de repouso. **Menor que a cronológica** = "
+            "corpo mais jovem que a idade; a linha verde mostra o possível com hábitos ideais."
+        )
         ult = fa.iloc[-1]
         delta = ult["idade_bio"] - ult["idade_cronologica"]
         c1, c2, c3 = st.columns(3)
@@ -1104,6 +1219,26 @@ def view_perfil():
                 st.progress(min(pct / 100, 1.0), text=f"vida útil estimada: {eq['vida_max_km']:.0f} km")
 
 
+def view_glossario():
+    st.header("📖 Glossário — como interpretar cada métrica")
+    st.markdown(
+        "Guia de referência das métricas usadas neste dashboard. "
+        "A regra de ouro: **compare-se com o seu próprio histórico** — as faixas de referência "
+        "são populacionais e servem apenas de norte."
+    )
+    df = pd.DataFrame(GLOSSARIO)
+    st.dataframe(df, use_container_width=True, hide_index=True, height=600)
+
+    st.subheader("🎚️ Regras rápidas: maior ou menor é melhor?")
+    maior = ["HRV", "VO₂ Máx", "Eficiência do sono", "Score de sono", "Body Battery (pico)", "SpO₂", "Cadência (até ~185)"]
+    menor = ["FC de repouso", "Ritmo (min/km)", "GCT", "Oscilação vertical", "Idade fisiológica", "Estresse", "Dívida de sono", "SWOLF"]
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### ✅ Quanto MAIOR, melhor\n" + "\n".join(f"- {t}" for t in maior))
+    with c2:
+        st.markdown("#### 🎯 Quanto MENOR, melhor\n" + "\n".join(f"- {t}" for t in menor))
+
+
 # ==================================================================== main
 st.markdown("<h1 class='main-header'>⚡ Garmin Connect Analytics</h1>", unsafe_allow_html=True)
 st.markdown(
@@ -1120,6 +1255,7 @@ abas = st.tabs([
     "💗 Saúde & Energia",
     "🔗 Correlações",
     "🏆 Perfil & Recordes",
+    "📖 Glossário",
 ])
 with abas[0]:
     view_resumo()
@@ -1135,3 +1271,5 @@ with abas[5]:
     view_correlacoes()
 with abas[6]:
     view_perfil()
+with abas[7]:
+    view_glossario()

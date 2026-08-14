@@ -111,8 +111,9 @@ class GarminExport:
         return _to_dt(ts_like) + pd.Timedelta(hours=self.tz_offset_hours)
 
     def _add_period_cols(self, df: pd.DataFrame, col: str = "date") -> pd.DataFrame:
+        df = df.copy()
         df[col] = pd.to_datetime(df[col], errors="coerce")
-        df = df.dropna(subset=[col]).copy()
+        df = df.dropna(subset=[col])
         df["year"] = df[col].dt.year
         df["month"] = df[col].dt.to_period("M").astype(str)
         df["week"] = df[col].dt.to_period("W").astype(str)
